@@ -1,0 +1,72 @@
+# Databricks notebook source
+# MAGIC %sql
+# MAGIC -- 1. Create a dedicated catalog for your POC
+# MAGIC CREATE CATALOG IF NOT EXISTS talk2db_poc;
+# MAGIC
+# MAGIC -- 2. Create a schema for your "raw/silver" data
+# MAGIC CREATE SCHEMA IF NOT EXISTS talk2db_poc.data_layer;
+# MAGIC
+# MAGIC -- 3. Create a schema specifically for the AI's metadata (The "Brain")
+# MAGIC CREATE SCHEMA IF NOT EXISTS talk2db_poc.ai_metadata;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC CREATE TABLE talk2db_poc.data_layer.customer_metrics (
+# MAGIC   customer_id INT,
+# MAGIC   customer_name STRING,
+# MAGIC   location STRING,
+# MAGIC   status_code INT COMMENT 'Business Logic: 0 = Churned, 1 = Active, 2 = Prospect',
+# MAGIC   total_spend DOUBLE,
+# MAGIC   last_login_date DATE
+# MAGIC ) 
+# MAGIC -- This makes it work with Vector Search later
+# MAGIC TBLPROPERTIES (delta.enableChangeDataFeed = true);
+# MAGIC
+# MAGIC -- Insert a few rows for testing
+# MAGIC INSERT INTO talk2db_poc.data_layer.customer_metrics VALUES 
+# MAGIC (101, 'Saketh', 'Charlotte', 1, 5000.00, '2026-03-20'),
+# MAGIC (102, 'John Doe', 'Charlotte', 0, 1500.00, '2025-12-15'),
+# MAGIC (103, 'Jane Smith', 'Fairfax', 0, 200.00, '2026-01-10');
+# MAGIC
+# MAGIC COMMENT ON TABLE talk2db_poc.data_layer.customer_metrics IS 'Contains core customer profiles, spending habits, and status for churn analysis.';
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC CREATE TABLE talk2db_poc.ai_metadata.table_descriptions (
+# MAGIC   table_name STRING,
+# MAGIC   table_purpose STRING,
+# MAGIC   business_rules STRING
+# MAGIC );
+# MAGIC
+# MAGIC INSERT INTO talk2db_poc.ai_metadata.table_descriptions VALUES 
+# MAGIC ('talk2db_poc.data_layer.customer_metrics', 
+# MAGIC  'Used for finding customer details and location-based counts.', 
+# MAGIC  'To find CHURNED users, filter where status_code = 0. To find ACTIVE users, status_code = 1.');
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC -- Replace with your actual table name if different
+# MAGIC ALTER TABLE talk2db_poc.ai_metadata.table_descriptions 
+# MAGIC SET TBLPROPERTIES (delta.enableChangeDataFeed = true);
+
+# COMMAND ----------
+
+from databricks.vector_search.client import VectorSearchClient
+
+client = VectorSearchClient()
+index = client.get_index(endpoint_name="talk2db_poc_endpoint", index_name="talk2db_poc.ai_metadata.table_index")
+
+# Simulate a user question
+query = "How many customers in Charlotte have stopped using our service?"
+
+results = index.similarity_search(
+  query_text=query,
+  columns=["table_name", "business_rules"],
+  num_results=1
+)
+
+print(f"Top Table Found: {results['result']['data_array'][0][0]}")
+print(f"Business Logic to use: {results['result']['data_array'][0][1]}")
