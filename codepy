@@ -1,42 +1,29 @@
-from pyspark.sql import functions as F
+from databricks.vector_search.client import VectorSearchClient
 
-# 1. Configuration & Paths
-SOURCE_TABLE = "talk2db_poc.data_layer.transaction_detail_ach"
-OUTPUT_TABLE = "talk2db_poc.data_layer.ach_orig_candidates_prepped"
+# 1. Initialize the Client
+vsc = VectorSearchClient()
 
-# 2. Define the Cleaning Pattern (The "Janitor")
-# We remove special characters and common banking noise, but keep the words
-# so the LLM and Vector Search have the full context of names like "FRANCHISE TAX BD"
-garbage_regex = r"([^\w\s]|\b(ACH|PMT|PAY|WEB|PPD|CCD|CTX|STORE|STE|STREET|SUITE)\b)"
+# 2. Point to your DEV index
+# Note: Ensure your workspace has a Vector Search Endpoint running
+index = vsc.get_index(
+    endpoint_name="your_vector_search_endpoint", # Replace with your actual endpoint name
+    index_name="dev.er_sp_metadata.spg_entity_master_index"
+)
 
-# 3. Load and Aggregate (The "Funnel" for Scale)
-# We group by Name + Routing so we only solve "FRANCHISE TAX BD" once
-raw_df = spark.table(SOURCE_TABLE)
+# 3. Test with a "Tricky" query (The U.S. Bank case)
+search_query = "U S BANK ANK" 
 
-df_agg = raw_df.groupBy("originator_company_name", "originating_rt_nbr") \
-    .agg(
-        F.count("*").alias("txn_count"),
-        F.sum("dest_transaction_amt").alias("total_txn_amt"),
-        F.first("dest_tr_nbr").alias("anchor_id") # Keeping a non-null ID for audit
-    )
+results = index.similarity_search(
+    query_text=search_query,
+    columns=["child_company_name", "parent_company_name", "city", "country"],
+    num_results=5
+)
 
-# 4. Apply Light Cleaning
-# This reveals the "Entity Signal" without losing the meaning of abbreviations
-df_cleaned = df_agg \
-    .withColumn("src_name_upper", F.upper(F.col("originator_company_name"))) \
-    .withColumn("src_name_clean", F.regexp_replace("src_name_upper", garbage_regex, " ")) \
-    .withColumn("src_name_final", F.trim(F.regexp_replace("src_name_clean", r"\s+", " "))) \
-    .select(
-        "anchor_id",
-        "originator_company_name", # Raw name for the "Conversation"
-        "src_name_final",          # Clean name for the "Librarian"
-        "originating_rt_nbr",
-        "txn_count",
-        "total_txn_amt"
-    )
+# 4. Display as a clean table
+import pandas as pd
+df_results = pd.DataFrame(
+    results['result']['data_array'], 
+    columns=["Child Name", "Parent Name", "City", "Country", "Score"]
+)
 
-# 5. Save the Progress
-df_cleaned.write.mode("overwrite").saveAsTable(OUTPUT_TABLE)
-
-print(f"Success! {SOURCE_TABLE} has been aggregated and cleaned.")
-print(f"Results stored in: {OUTPUT_TABLE}")
+display(df_results)
