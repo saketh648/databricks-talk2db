@@ -1,61 +1,82 @@
-import pyspark.sql.functions as F
+from databricks.vector_search.client import VectorSearchClient
+import pandas as pd
+import time
 
-# 1. Configuration
-TABLE_ORG = "dev.mma_entityresolution.tbl_entityres_ach_org_names_match"
-TABLE_REC = "dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"
+# 1. Initialize Vector Search Client
+vsc = VectorSearchClient()
+index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", index_name="dev.er_sp_metadata.spg_entity_master_index")
 
-# 2. Refined Repair Logic
-def apply_name_repair(df, raw_name_col):
-    """
-    Implements Methods 1, 2, and 3 logic from the requirements.
-    """
-    # Define noise and legal tokens
-    noise_tokens = ['ACH', 'WEB', 'PPD', 'CCD', 'CTX', 'PMT', 'PAY', 'PAYMENT', 'TRANSFER', 'TRANSACTION']
-    geo_tokens = ['ST', 'STREET', 'RD', 'ROAD', 'AVE', 'AVENUE', 'BLVD', 'STE', 'TX', 'MN', 'CA', 'NY', 'FL']
-    legal_suffixes = r"\b(INC|LLC|LTD|CO|COMPANY|CORP|CORPORATION|LP|LLP|PLC|PC|HOLDINGS)\b"
+# 2. Get unique names from our Phase 2 search_registry
+unique_names_list = [row.src_company_name_normalized for row in search_registry.collect()]
+
+match_results = []
+start_time = time.time()
+
+print(f"Starting Vector Search for {len(unique_names_list)} unique candidates...")
+
+# 3. Execution Loop
+# Note: We query Top 2 to handle the 'Generic/Ambiguous' check from Step 6
+for i, name in enumerate(unique_names_list):
+    if i % 500 == 0 and i > 0:
+        print(f"Processed {i} names... (Elapsed: {round(time.time() - start_time, 2)}s)")
     
-    # Method 1: Canonicalization (Upper, Strip Punctuation)
-    # Using the raw name provided by your specific column mapping
-    df = df.withColumn("src_company_name_raw", F.col(raw_name_col))
-    df = df.withColumn("src_company_name_canonical", F.upper(F.trim(F.col("src_company_name_raw"))))
-    df = df.withColumn("src_company_name_canonical", F.regexp_replace("src_company_name_canonical", r"[^A-Z0-9\s]", " "))
-    
-    # Remove noise/geo tokens
-    for token in noise_tokens + geo_tokens:
-        df = df.withColumn("src_company_name_canonical", 
-            F.regexp_replace("src_company_name_canonical", rf"\b{token}\b", ""))
+    try:
+        search_resp = index.similarity_search(
+            query_text=name,
+            columns=["child_company_id", "parent_company_id", "primary_business_name"],
+            num_results=2
+        )
+        
+        # Extract data
+        data = search_resp.get('result', {}).get('data_array', [])
+        
+        if data:
+            top1 = data[0]
+            # Use a dummy for top2 if only 1 result returned
+            top2 = data[1] if len(data) > 1 else [None, None, None, 0.0]
+            
+            match_results.append({
+                "src_company_name_normalized": name,
+                "matched_sp_primary_name": top1[2],
+                "matched_sp_child_id": top1[0],
+                "matched_sp_parent_id": top1[1],
+                "match_confidence_score": float(top1[3]) * 100,
+                "top2_score": float(top2[3]) * 100
+            })
+        else:
+            match_results.append({
+                "src_company_name_normalized": name,
+                "matched_sp_primary_name": None,
+                "matched_sp_child_id": None,
+                "matched_sp_parent_id": None,
+                "match_confidence_score": 0.0,
+                "top2_score": 0.0
+            })
+            
+    except Exception as e:
+        print(f"Error at index {i} for name '{name}': {e}")
+        continue
 
-    # Method 2: Abbreviation Expansion
-    abbrev_dict = {"USB ANK": "U S BANK", "US BANK": "U S BANK", "AMZN": "AMAZON", "CVS": "CVS PHARMACY", "WMT": "WALMART"}
-    mapping_expr = F.create_map([F.lit(x) for x in sum(abbrev_dict.items(), ())])
-    
-    df = df.withColumn("src_company_name_enriched", 
-        F.coalesce(mapping_expr[F.col("src_company_name_canonical")], F.col("src_company_name_canonical")))
-    
-    # Step 3: Normalization (Final string for Vector Search)
-    df = df.withColumn("src_company_name_normalized", 
-        F.trim(F.regexp_replace("src_company_name_enriched", legal_suffixes, "")))
-    
-    return df.withColumn("src_company_name_normalized", F.regexp_replace("src_company_name_normalized", r"\s+", " "))
+# 4. Convert Results to Spark DataFrame
+results_pd = pd.DataFrame(match_results)
+results_df = spark.createDataFrame(results_pd)
 
-# 3. Process the ORG Table (5,000 rows)
-df_org = spark.table(TABLE_ORG)
-df_org_prepped = apply_name_repair(df_org, "originator_company_name") \
-    .withColumn("role_type", F.lit("ACH_ORIGINATION")) \
-    .select("sor_id", "role_type", "src_company_name_raw", "party_name_clean", "src_company_name_normalized")
+# 5. Apply Step 6 Decision Rules
+# Thresholds: 92 (CHILD), 85 (PARENT)
+# Ambiguity Rule: (top1 - top2) < 3 points
+final_matches_registry = results_df.withColumn("match_level", 
+    F.when(
+        (F.col("match_confidence_score") >= 92) & 
+        ((F.col("match_confidence_score") - F.col("top2_score")) >= 3), 
+        "CHILD"
+    )
+    .when(F.col("match_confidence_score") >= 85, "PARENT")
+    .otherwise("UNMATCHED")
+).withColumn("match_method", F.lit("VECTOR_SEARCH_COSINE"))
 
-# 4. Process the REC Table (5,000 rows)
-df_rec = spark.table(TABLE_REC)
-df_rec_prepped = apply_name_repair(df_rec, "dest_customer_nm") \
-    .withColumn("role_type", F.lit("ACH_RECEIVED")) \
-    .select("sor_id", "role_type", "src_company_name_raw", "party_name_clean", "src_company_name_normalized")
+# 6. Final Join back to your 10,000 Source Rows
+final_org_results = df_org_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
+final_rec_results = df_rec_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
 
-# 5. Create Search Registry (Unique Names for talk2db_poc_endpoint)
-search_registry = df_org_prepped.select("src_company_name_normalized") \
-    .union(df_rec_prepped.select("src_company_name_normalized")) \
-    .distinct() \
-    .filter("src_company_name_normalized IS NOT NULL AND src_company_name_normalized != ''")
-
-print(f"Phase 1 Complete.")
-print(f"Total Source Rows: {df_org_prepped.count() + df_rec_prepped.count()}")
-print(f"Unique Search Candidates: {search_registry.count()}")
+print(f"Phase 3 Complete. Total matches processed: {len(match_results)}")
+display(final_org_results.limit(10))
