@@ -1,32 +1,7 @@
-# This should be much faster than the 5-minute search!
-output_org.write.format("delta").mode("overwrite") \
-    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_origination")
-
-output_rec.write.format("delta").mode("overwrite") \
-    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_received")
-
-print("Done! Check your 'dev.mma_entityresolution' database.")
-
-
-
-
-# Function to add the mandatory 'match_explanation' column required by Step 7
-def add_final_metadata(df):
-    return df.withColumn("match_explanation", 
-        F.when(F.col("match_level") == "CHILD", "High Confidence Granular Match (Score >= 92)")
-         .when(F.col("match_level") == "PARENT", "Medium Confidence Parent Roll-up (Score 85-91)")
-         .otherwise("Unmatched - Below Threshold or Generic Name")
-    )
-
-# 1. Finalize the dataframes with metadata
-output_org = add_final_metadata(final_org_results)
-output_rec = add_final_metadata(final_rec_results)
-
-# 2. Persist to Delta Tables (This is what actually creates the files)
-output_org.write.format("delta").mode("overwrite") \
-    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_origination")
-
-output_rec.write.format("delta").mode("overwrite") \
-    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_received")
-
-print("✅ Final tables successfully created in dev.mma_entityresolution!")
+# Look at the top 20 rows where a name was found, regardless of the threshold
+display(final_matches_registry.select(
+    "src_company_name_normalized", 
+    "matched_sp_primary_name", 
+    "match_confidence_score", 
+    "top2_score"
+).filter("matched_sp_primary_name IS NOT NULL").limit(20))
