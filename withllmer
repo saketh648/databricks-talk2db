@@ -1,61 +1,127 @@
+import pandas as pd
 import pyspark.sql.functions as F
+from pyspark.sql.types import *
+from databricks.vector_search.client import VectorSearchClient
 
-# 1. Join the Search Registry to the Main Data
-# We bring in 'candidates_json' and 'match_confidence_score'
-df_final_org = df_org_clean.join(
-    final_matches_registry, 
-    on="src_company_name_normalized", 
-    how="left"
-).repartition(100) # Parallelize for API throughput
+# ==========================================
+# PHASE 1: DATA INGESTION & NAME REPAIR
+# ==========================================
+# Load the raw candidate tables from your dev catalog
+TABLE_ORG = "dev.mma_entityresolution.tbl_entityres_ach_org_names_match"
+TABLE_REC = "dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"
 
-# 2. Structured Prompt for Llama 4 Maverick
-# We ask it to pick the best 'partyname' (legal name) and explain why
-prompt_logic = """
-format_string(
-    "### Role: Financial Auditor. Task: Select the best legal party match.
-     Transaction Name: %s
-     S&P Candidates: %s
-     
-     Instructions: Pick the best Name from the JSON. If no candidate fits, say 'Invalid'.
-     Format: NAME: [Selected Name] REASON: [Short Explanation]", 
-    src_company_name_raw, 
-    candidates_json
-)
-"""
+# Standardize column names and role types
+df_org = spark.table(TABLE_ORG).withColumn("role_type", F.lit("ACH_ORIGINATION")) \
+              .withColumnRenamed("originator_company_name", "src_company_name_raw")
 
-# 3. Call Llama 4 Maverick
-df_final_org = df_final_org.withColumn("llm_raw", 
-    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, max_tokens => 60, temperature => 0)")
-)
+df_rec = spark.table(TABLE_REC).withColumn("role_type", F.lit("ACH_RECEIVED")) \
+              .withColumnRenamed("dest_customer_nm", "src_company_name_raw")
 
-# 4. Parse LLM Output and Apply Business Rules
-df_final_org = df_final_org.withColumn("childcompanyname", 
-    F.regexp_extract("llm_raw", r"NAME:\s*(.*?)\s*REASON:", 1)) \
-    .withColumn("match_explanation", 
-    F.regexp_extract("llm_raw", r"REASON:\s*(.*)", 1))
+# Canonicalization: Remove noise for better vector matching
+def clean_names(df):
+    return df.withColumn("src_company_name_normalized", 
+        F.trim(F.regexp_replace(F.upper(F.col("src_company_name_raw")), r"[^\w\s]", "")))
 
-# 5. Final Decision Logic for Match Level
-# Rules: 
-# - Invalid/Null -> UNMATCHED
-# - Score >= 92 -> CHILD
-# - 80-91 -> PARENT
-df_final_org = df_final_org.withColumn("match_level", 
-    F.when(F.col("llm_raw").contains("Invalid") | F.col("llm_raw").isNull(), "UNMATCHED")
-     .when(F.col("match_confidence_score") >= 92, "CHILD")
-     .when(F.col("match_confidence_score") >= 80, "PARENT")
-     .otherwise("UNMATCHED")
-)
+df_org_clean = clean_names(df_org)
+df_rec_clean = clean_names(df_rec)
 
-# 6. Select Only the Specific Columns Requested
-final_output = df_final_org.select(
-    "src_company_name_raw",          # Original messy name
-    "src_company_name_normalized",   # The 'Clean' version used for matching
-    "childcompanyname",              # AI-selected legal party name
-    "match_confidence_score",        # Vector similarity score (0-100)
-    "top2_score",                    # Score of the runner-up for ambiguity check
-    "match_level",                   # Business classification (CHILD/PARENT/UNMATCHED)
-    "match_explanation"              # LLM-generated reason
-)
+# Create a Search Registry of unique names to minimize costs
+search_registry = df_org_clean.select("src_company_name_normalized") \
+    .union(df_rec_clean.select("src_company_name_normalized")) \
+    .distinct().filter("src_company_name_normalized != ''")
 
-# Display result
-display(final_output.limit(10))
+# ==========================================
+# PHASE 2: VECTOR SEARCH (TOP 3 RETRIEVAL)
+# ==========================================
+result_schema = StructType([
+    StructField("src_company_name_normalized", StringType(), True),
+    StructField("candidates_json", StringType(), True),
+    StructField("match_confidence_score", FloatType(), True),
+    StructField("top2_score", FloatType(), True)
+])
+
+def search_vector_worker_top3(iterator):
+    import json
+    vsc = VectorSearchClient()
+    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", 
+                         index_name="dev.er_sp_metadata.spg_entity_master_index")
+    for pdf in iterator:
+        results = []
+        for name in pdf['src_company_name_normalized']:
+            try:
+                resp = index.similarity_search(query_text=name, 
+                                             columns=["childcompanyid", "childcompanyname", "companytypename"], 
+                                             num_results=3)
+                data = resp.get('result', {}).get('data_array', [])
+                candidates = [{"id": str(r[0]), "name": str(r[1]), "type": str(r[2]), "score": round(float(r[3])*100, 2)} for r in data]
+                
+                results.append({
+                    "src_company_name_normalized": name,
+                    "candidates_json": json.dumps(candidates),
+                    "match_confidence_score": candidates[0]['score'] if candidates else 0.0,
+                    "top2_score": candidates[1]['score'] if len(candidates) > 1 else 0.0
+                })
+            except:
+                results.append({"src_company_name_normalized": name, "candidates_json": "[]", "match_confidence_score": 0.0, "top2_score": 0.0})
+        yield pd.DataFrame(results)
+
+# Execute Search Registry (Repartition to 40 for parallelism)
+final_matches_registry = search_registry.repartition(40).mapInPandas(search_vector_worker_top3, schema=result_schema).cache()
+final_matches_registry.count() # Force materialization of cache
+
+# ==========================================
+# PHASE 3: REUSABLE LLM PROCESSING FUNCTION
+# ==========================================
+def process_and_write_table(df_clean, target_table_name):
+    # 1. Join Registry results and Repartition to 100 for API throughput
+    df_joined = df_clean.join(final_matches_registry, on="src_company_name_normalized", how="left").repartition(100)
+    
+    # 2. Define Structured Prompt for Maverick
+    prompt_logic = """
+    format_string(
+        "### Role: Financial Auditor. Task: Select the best legal party match. 
+         Transaction Name: %s. Candidates: %s. 
+         Rule: If none match, say 'Invalid'. 
+         Format: NAME: [Selected Name] REASON: [Short Reason].", 
+        src_company_name_raw, 
+        candidates_json
+    )
+    """
+    
+    # 3. Call Llama 4 Maverick (Using Map syntax for parameters)
+    df_llm = df_joined.withColumn("llm_raw", 
+        F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '60', 'temperature', '0'))")
+    )
+    
+    # 4. Regex Parsing to extract clean columns from LLM response
+    df_parsed = df_llm.withColumn("childcompanyname", F.regexp_extract("llm_raw", r"NAME:\s*(.*?)\s*REASON:", 1)) \
+                      .withColumn("match_explanation", F.regexp_extract("llm_raw", r"REASON:\s*(.*)", 1))
+    
+    # 5. Apply Final Decision Rules
+    df_final = df_parsed.withColumn("match_level", 
+        F.when(F.col("llm_raw").contains("Invalid") | F.col("llm_raw").isNull(), "UNMATCHED")
+         .when(F.col("match_confidence_score") >= 92, "CHILD")
+         .otherwise("PARENT")
+    )
+    
+    # 6. Select Final Schema and Write to Delta
+    final_cols = [
+        "sor_id", "src_company_name_raw", "src_company_name_normalized", 
+        "childcompanyname", "match_confidence_score", "top2_score", 
+        "match_level", "match_explanation"
+    ]
+    
+    df_final.select(final_cols).write.format("delta").mode("overwrite") \
+            .option("overwriteSchema", "true") \
+            .saveAsTable(f"dev.mma_entityresolution.{target_table_name}")
+    
+    print(f"✅ Success: {target_table_name} generated.")
+
+# ==========================================
+# PHASE 4: EXECUTION
+# ==========================================
+# Generate Origination Table
+process_and_write_table(df_org_clean, "entity_resolution_ach_origination")
+
+# Generate Received Table
+process_and_write_table(df_rec_clean, "entity_resolution_ach_received")
