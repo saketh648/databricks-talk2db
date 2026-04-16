@@ -1,7 +1,86 @@
-# Look at the top 20 rows where a name was found, regardless of the threshold
-display(final_matches_registry.select(
-    "src_company_name_normalized", 
-    "matched_sp_primary_name", 
+from databricks.vector_search.client import VectorSearchClient
+import pandas as pd
+from pyspark.sql.types import *
+import pyspark.sql.functions as F
+
+# 1. Define the schema for the results (Updated to match your index field names)
+result_schema = StructType([
+    StructField("src_company_name_normalized", StringType(), True),
+    StructField("childcompanyname", StringType(), True),
+    StructField("childcompanyid", StringType(), True),
+    StructField("companytypename", StringType(), True),
+    StructField("match_confidence_score", FloatType(), True),
+    StructField("top2_score", FloatType(), True)
+])
+
+# 2. Define the function that runs ON THE WORKERS
+def search_vector_worker(iterator):
+    # Initialize the client ONCE per worker partition
+    vsc = VectorSearchClient()
+    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", 
+                         index_name="dev.er_sp_metadata.spg_entity_master_index")
+    
+    for pdf in iterator:
+        results = []
+        for name in pdf['src_company_name_normalized']:
+            try:
+                # Query Top 2 using YOUR specific fields
+                resp = index.similarity_search(
+                    query_text=name,
+                    columns=["childcompanyid", "childcompanyname", "companytypename"],
+                    num_results=2
+                )
+                data = resp.get('result', {}).get('data_array', [])
+                
+                if data:
+                    top1 = data[0]
+                    # Data mapping based on columns order: [id=0, name=1, type=2, score=3]
+                    top2_score = float(data[1][3]) * 100 if len(data) > 1 else 0.0
+                    
+                    results.append({
+                        "src_company_name_normalized": str(name),
+                        "childcompanyname": str(top1[1]) if top1[1] else None,
+                        "childcompanyid": str(top1[0]) if top1[0] else None,
+                        "companytypename": str(top1[2]) if top1[2] else None,
+                        "match_confidence_score": float(top1[3]) * 100,
+                        "top2_score": top2_score
+                    })
+                else:
+                    results.append({
+                        "src_company_name_normalized": str(name), "childcompanyname": None, 
+                        "childcompanyid": None, "companytypename": None, 
+                        "match_confidence_score": 0.0, "top2_score": 0.0
+                    })
+            except Exception as e:
+                # Capture the error message in the name field for debugging
+                results.append({
+                    "src_company_name_normalized": str(name), 
+                    "childcompanyname": f"ERROR: {str(e)[:50]}", 
+                    "childcompanyid": None, "companytypename": None, 
+                    "match_confidence_score": 0.0, "top2_score": 0.0
+                })
+        
+        yield pd.DataFrame(results)
+
+# 3. Trigger Distributed Execution
+final_matches_registry = search_registry.mapInPandas(search_vector_worker, schema=result_schema)
+
+# 4. Apply Decision Rules and Cache
+final_matches_registry = final_matches_registry.withColumn("match_level", 
+    F.when((F.col("match_confidence_score") >= 92) & 
+           ((F.col("match_confidence_score") - F.col("top2_score")) >= 3), "CHILD")
+    .when(F.col("match_confidence_score") >= 85, "PARENT")
+    .otherwise("UNMATCHED")
+).cache()
+
+# 5. Final Join back to your Source and Destination tables
+final_org_results = df_org_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
+final_rec_results = df_rec_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
+
+# Display a sample of the Source matches
+display(final_org_results.select(
+    "src_company_name_raw", 
+    "childcompanyname", 
     "match_confidence_score", 
-    "top2_score"
-).filter("matched_sp_primary_name IS NOT NULL").limit(20))
+    "match_level"
+).limit(10))
