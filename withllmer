@@ -1,79 +1,45 @@
-# Updated Schema to hold 3 candidates
-result_schema = StructType([
-    StructField("src_company_name_normalized", StringType(), True),
-    StructField("candidates_json", StringType(), True), # Store all 3 as a JSON string
-    StructField("match_confidence_score", FloatType(), True) # Best score for initial filtering
-])
+import pyspark.sql.functions as F
 
-def search_vector_worker_top3(iterator):
-    import json
-    vsc = VectorSearchClient()
-    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", 
-                         index_name="dev.er_sp_metadata.spg_entity_master_index")
-    for pdf in iterator:
-        results = []
-        for name in pdf['src_company_name_normalized']:
-            try:
-                resp = index.similarity_search(query_text=name, 
-                                             columns=["childcompanyid", "childcompanyname", "companytypename"], 
-                                             num_results=3)
-                data = resp.get('result', {}).get('data_array', [])
-                
-                # Format the 3 results into a list for the LLM
-                candidates = []
-                for row in data:
-                    candidates.append({
-                        "id": str(row[0]), 
-                        "name": str(row[1]), 
-                        "type": str(row[2]), 
-                        "score": round(float(row[3]) * 100, 2)
-                    })
-                
-                results.append({
-                    "src_company_name_normalized": name,
-                    "candidates_json": json.dumps(candidates),
-                    "match_confidence_score": candidates[0]['score'] if candidates else 0.0
-                })
-            except:
-                results.append({"src_company_name_normalized": name, "candidates_json": "[]", "match_confidence_score": 0.0})
-        yield pd.DataFrame(results)
+# 1. Join the Registry (which has candidates_json) to your Main Table
+# We use a left join on the normalized name
+df_final_org = df_org_clean.join(
+    final_matches_registry, 
+    on="src_company_name_normalized", 
+    how="left"
+)
 
-final_matches_registry = search_registry.repartition(20).mapInPandas(search_vector_worker_top3, schema=result_schema).cache()
-
-
-
-
-
-
-
-
-
-# 1. New Prompt Logic: Providing the LLM with a list of options
+# 2. Define the Maverick Prompt Logic
+# This uses the candidates_json column that is now properly joined
 prompt_logic = """
 format_string(
-    "Source Name: %s. Here are the Top 3 S&P Candidates: %s. 
-     Task: Pick the best match. 
-     Return exactly in this format: [Best Name] | [Reasoning]. 
-     If none match well, return 'Invalid'.", 
+    "Source Name: %s. Candidates: %s. Task: Pick the best match from the JSON list. 
+     Return format: [Best Name] | [Reasoning]. If no match, return 'Invalid | No match'.", 
     src_company_name_raw, 
     candidates_json
 )
 """
 
-# 2. Run Maverick to decide between the 3
+# 3. Call Llama 4 Maverick
 df_final_org = df_final_org.withColumn("llm_decision", 
     F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic})")
 )
 
-# 3. Split the decision into 'matched_name' and 'match_explanation'
-df_final_org = df_final_org.withColumn("match_explanation", F.split("llm_decision", " \| ").getItem(1)) \
-                           .withColumn("childcompanyname", F.split("llm_decision", " \| ").getItem(0))
+# 4. Parse the LLM's "Split" response into separate columns
+# We use split and getItem to extract the Name and the Explanation
+df_final_org = df_final_org.withColumn("childcompanyname", F.split("llm_decision", " \| ").getItem(0)) \
+                           .withColumn("match_explanation", F.split("llm_decision", " \| ").getItem(1))
 
-# 4. Final Level Logic
+# 5. Apply Final Decision Rules
 df_final_org = df_final_org.withColumn("match_level", 
     F.when(F.col("llm_decision").contains("Invalid"), "UNMATCHED")
      .when(F.col("match_confidence_score") >= 92, "CHILD")
      .otherwise("PARENT")
 )
 
-display(df_final_org.select("src_company_name_raw", "childcompanyname", "match_explanation").limit(10))
+# Display to verify
+display(df_final_org.select(
+    "src_company_name_raw", 
+    "childcompanyname", 
+    "match_explanation", 
+    "match_level"
+).limit(10))
