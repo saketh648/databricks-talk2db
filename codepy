@@ -1,48 +1,74 @@
-import json
-import time
 from databricks.vector_search.client import VectorSearchClient
+import pandas as pd
+from pyspark.sql.types import *
 
-# 1. Setup Client
-vsc = VectorSearchClient()
-index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", index_name="dev.er_sp_metadata.spg_entity_master_index")
+# 1. Define the schema for the results
+result_schema = StructType([
+    StructField("src_company_name_normalized", StringType(), True),
+    StructField("matched_sp_primary_name", StringType(), True),
+    StructField("matched_sp_child_id", StringType(), True),
+    StructField("matched_sp_parent_id", StringType(), True),
+    StructField("match_confidence_score", FloatType(), True),
+    StructField("top2_score", FloatType(), True)
+])
 
-# 2. Get unique names from your existing search_registry
-unique_names_list = [row.src_company_name_normalized for row in search_registry.collect()]
-
-# 3. Process loop (Writing to local disk to save Driver RAM)
-local_file_path = "/tmp/vector_results_raw.json"
-start_time = time.time()
-
-print(f"Starting Vector Search for {len(unique_names_list)} names...")
-
-with open(local_file_path, "w") as f:
-    for i, name in enumerate(unique_names_list):
-        if i % 250 == 0 and i > 0:
-            elapsed = round(time.time() - start_time, 2)
-            print(f"Processed {i} / {len(unique_names_list)}... ({elapsed}s)")
+# 2. Define the function that runs ON THE WORKERS
+def search_vector_worker(iterator):
+    # Initialize the client ONCE per worker partition
+    vsc = VectorSearchClient()
+    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", 
+                         index_name="dev.er_sp_metadata.spg_entity_master_index")
+    
+    for pdf in iterator:
+        results = []
+        for name in pdf['src_company_name_normalized']:
+            try:
+                # Query Top 2
+                resp = index.similarity_search(
+                    query_text=name,
+                    columns=["child_company_id", "parent_company_id", "primary_business_name"],
+                    num_results=2
+                )
+                data = resp.get('result', {}).get('data_array', [])
+                
+                if data:
+                    top1 = data[0]
+                    top2 = data[1] if len(data) > 1 else [None, None, None, 0.0]
+                    results.append({
+                        "src_company_name_normalized": str(name),
+                        "matched_sp_primary_name": str(top1[2]) if top1[2] else None,
+                        "matched_sp_child_id": str(top1[0]) if top1[0] else None,
+                        "matched_sp_parent_id": str(top1[1]) if top1[1] else None,
+                        "match_confidence_score": float(top1[3]) * 100,
+                        "top2_score": float(top2[3]) * 100
+                    })
+                else:
+                    results.append({"src_company_name_normalized": str(name), "matched_sp_primary_name": None, 
+                                    "matched_sp_child_id": None, "matched_sp_parent_id": None, 
+                                    "match_confidence_score": 0.0, "top2_score": 0.0})
+            except:
+                results.append({"src_company_name_normalized": str(name), "matched_sp_primary_name": "ERROR", 
+                                "matched_sp_child_id": None, "matched_sp_parent_id": None, 
+                                "match_confidence_score": 0.0, "top2_score": 0.0})
         
-        try:
-            # Search for Top 2 (to check for score gap/ambiguity)
-            resp = index.similarity_search(
-                query_text=name,
-                columns=["child_company_id", "parent_company_id", "primary_business_name"],
-                num_results=2
-            )
-            
-            data = resp.get('result', {}).get('data_array', [])
-            
-            # Structure the result
-            res_row = {
-                "src_company_name_normalized": str(name),
-                "matched_sp_primary_name": str(data[0][2]) if data else None,
-                "matched_sp_child_id": str(data[0][0]) if data else None,
-                "matched_sp_parent_id": str(data[0][1]) if data else None,
-                "match_confidence_score": float(data[0][3] * 100) if data else 0.0,
-                "top2_score": float(data[1][3] * 100) if len(data) > 1 else 0.0
-            }
-            f.write(json.dumps(res_row) + "\n")
-            
-        except Exception as e:
-            print(f"Error at index {i} ({name}): {e}")
+        yield pd.DataFrame(results)
 
-print(f"Search Complete! Results saved locally to {local_file_path}")
+# 3. Trigger the Distributed Execution
+# This sends the 9,993 names to the workers to be searched in parallel
+final_matches_registry = search_registry.mapInPandas(search_vector_worker, schema=result_schema)
+
+# 4. Apply Decision Rules and Cache
+import pyspark.sql.functions as F
+
+final_matches_registry = final_matches_registry.withColumn("match_level", 
+    F.when((F.col("match_confidence_score") >= 92) & 
+           ((F.col("match_confidence_score") - F.col("top2_score")) >= 3), "CHILD")
+    .when(F.col("match_confidence_score") >= 85, "PARENT")
+    .otherwise("UNMATCHED")
+).cache() # Cache to avoid re-running the search multiple times
+
+# 5. Final Join
+final_org_results = df_org_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
+final_rec_results = df_rec_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
+
+display(final_org_results.limit(10))
