@@ -1,74 +1,8 @@
-from databricks.vector_search.client import VectorSearchClient
-import pandas as pd
-from pyspark.sql.types import *
+# This should be much faster than the 5-minute search!
+output_org.write.format("delta").mode("overwrite") \
+    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_origination")
 
-# 1. Define the schema for the results
-result_schema = StructType([
-    StructField("src_company_name_normalized", StringType(), True),
-    StructField("matched_sp_primary_name", StringType(), True),
-    StructField("matched_sp_child_id", StringType(), True),
-    StructField("matched_sp_parent_id", StringType(), True),
-    StructField("match_confidence_score", FloatType(), True),
-    StructField("top2_score", FloatType(), True)
-])
+output_rec.write.format("delta").mode("overwrite") \
+    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_received")
 
-# 2. Define the function that runs ON THE WORKERS
-def search_vector_worker(iterator):
-    # Initialize the client ONCE per worker partition
-    vsc = VectorSearchClient()
-    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", 
-                         index_name="dev.er_sp_metadata.spg_entity_master_index")
-    
-    for pdf in iterator:
-        results = []
-        for name in pdf['src_company_name_normalized']:
-            try:
-                # Query Top 2
-                resp = index.similarity_search(
-                    query_text=name,
-                    columns=["child_company_id", "parent_company_id", "primary_business_name"],
-                    num_results=2
-                )
-                data = resp.get('result', {}).get('data_array', [])
-                
-                if data:
-                    top1 = data[0]
-                    top2 = data[1] if len(data) > 1 else [None, None, None, 0.0]
-                    results.append({
-                        "src_company_name_normalized": str(name),
-                        "matched_sp_primary_name": str(top1[2]) if top1[2] else None,
-                        "matched_sp_child_id": str(top1[0]) if top1[0] else None,
-                        "matched_sp_parent_id": str(top1[1]) if top1[1] else None,
-                        "match_confidence_score": float(top1[3]) * 100,
-                        "top2_score": float(top2[3]) * 100
-                    })
-                else:
-                    results.append({"src_company_name_normalized": str(name), "matched_sp_primary_name": None, 
-                                    "matched_sp_child_id": None, "matched_sp_parent_id": None, 
-                                    "match_confidence_score": 0.0, "top2_score": 0.0})
-            except:
-                results.append({"src_company_name_normalized": str(name), "matched_sp_primary_name": "ERROR", 
-                                "matched_sp_child_id": None, "matched_sp_parent_id": None, 
-                                "match_confidence_score": 0.0, "top2_score": 0.0})
-        
-        yield pd.DataFrame(results)
-
-# 3. Trigger the Distributed Execution
-# This sends the 9,993 names to the workers to be searched in parallel
-final_matches_registry = search_registry.mapInPandas(search_vector_worker, schema=result_schema)
-
-# 4. Apply Decision Rules and Cache
-import pyspark.sql.functions as F
-
-final_matches_registry = final_matches_registry.withColumn("match_level", 
-    F.when((F.col("match_confidence_score") >= 92) & 
-           ((F.col("match_confidence_score") - F.col("top2_score")) >= 3), "CHILD")
-    .when(F.col("match_confidence_score") >= 85, "PARENT")
-    .otherwise("UNMATCHED")
-).cache() # Cache to avoid re-running the search multiple times
-
-# 5. Final Join
-final_org_results = df_org_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
-final_rec_results = df_rec_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
-
-display(final_org_results.limit(10))
+print("Done! Check your 'dev.mma_entityresolution' database.")
