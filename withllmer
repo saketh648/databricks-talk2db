@@ -1,7 +1,6 @@
 import pyspark.sql.functions as F
 
 # 1. Join the Registry (which has candidates_json) to your Main Table
-# We use a left join on the normalized name
 df_final_org = df_org_clean.join(
     final_matches_registry, 
     on="src_company_name_normalized", 
@@ -9,7 +8,6 @@ df_final_org = df_org_clean.join(
 )
 
 # 2. Define the Maverick Prompt Logic
-# This uses the candidates_json column that is now properly joined
 prompt_logic = """
 format_string(
     "Source Name: %s. Candidates: %s. Task: Pick the best match from the JSON list. 
@@ -20,38 +18,37 @@ format_string(
 """
 
 # 3. Call Llama 4 Maverick
-df_final_org = df_final_org.withColumn("llm_decision", 
+# We use repartition(40) here to force parallelism and speed up the API calls
+df_final_org = df_final_org.repartition(40).withColumn("llm_decision", 
     F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic})")
 )
 
-# 4. Parse the LLM's "Split" response into separate columns
-# We use split and getItem to extract the Name and the Explanation
-df_final_org = df_final_org.withColumn("childcompanyname", F.split("llm_decision", " \| ").getItem(0)) \
-                           .withColumn("match_explanation", F.split("llm_decision", " \| ").getItem(1))
+# 4. Parse the LLM's "Split" response and Apply Decision Rules
+df_final_org = df_final_org.withColumn("childcompanyname", F.split("llm_decision", r" \| ").getItem(0)) \
+                           .withColumn("match_explanation", F.split("llm_decision", r" \| ").getItem(1)) \
+                           .withColumn("match_level", 
+                                F.when(F.col("llm_decision").contains("Invalid"), "UNMATCHED")
+                                 .when(F.col("match_confidence_score") >= 92, "CHILD")
+                                 .otherwise("PARENT"))
 
-# 5. Apply Final Decision Rules
-df_final_org = df_final_org.withColumn("match_level", 
-    F.when(F.col("llm_decision").contains("Invalid"), "UNMATCHED")
-     .when(F.col("match_confidence_score") >= 92, "CHILD")
-     .otherwise("PARENT")
+# 5. SELECT ONLY THE REQUIRED COLUMNS (The Cleanup Step)
+# This prevents the 'all columns' issue you are seeing
+final_deliverable_df = df_final_org.select(
+    "sor_id", 
+    "src_company_name_raw", 
+    "role_type",
+    "match_level", 
+    "match_confidence_score",
+    "childcompanyname", 
+    "childcompanyid", 
+    "companytypename",
+    "match_explanation"
 )
 
-# Display to verify
-display(df_final_org.select(
-    "src_company_name_raw", 
-    "childcompanyname", 
-    "match_explanation", 
-    "match_level"
-).limit(10))
-
-
-
-
-# Add .option("overwriteSchema", "true") to your write command
-df_final_org.write.format("delta") \
+# 6. Final Write
+final_deliverable_df.write.format("delta") \
     .mode("overwrite") \
     .option("overwriteSchema", "true") \
     .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_origination")
 
-print("✅ Success: Table rewritten with the new AI schema.")
-
+print("✅ Success: Clean table created with only the 9 essential columns.")
