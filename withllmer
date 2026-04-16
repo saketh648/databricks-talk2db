@@ -43,3 +43,15 @@ display(df_final_org.select(
     "match_explanation", 
     "match_level"
 ).limit(10))
+
+
+
+
+# Add .option("overwriteSchema", "true") to your write command
+df_final_org.write.format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_origination")
+
+print("✅ Success: Table rewritten with the new AI schema.")
+
