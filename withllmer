@@ -115,3 +115,34 @@ df_final_org.write.format("delta").mode("overwrite") \
 
 print("Pipeline Complete. Files stored and LLM Reasoning applied.")
 
+
+
+
+
+import pyspark.sql.functions as F
+
+# 1. Define the prompt using native Spark string concatenation or format_string
+# This avoids the "at or near s" error by keeping the prompt logic inside SQL
+prompt_logic = """
+format_string(
+    "Act as a financial data auditor. Source Name: %s. S&P Match: %s (Type: %s). Does the source name reasonably represent this S&P entity? Explain the relationship in one short sentence. If it's a poor match, start with 'Invalid'. Explanation:", 
+    src_company_name_raw, 
+    childcompanyname, 
+    companytypename
+)
+"""
+
+# 2. Apply ai_query using the formatted string
+df_final_org = df_final_org.withColumn("match_explanation", 
+    F.expr(f"ai_query('databricks-meta-llama-3-70b-instruct', {prompt_logic})")
+)
+
+# 3. Apply Decision Rules based on the LLM's feedback
+df_final_org = df_final_org.withColumn("match_level", 
+    F.when(F.col("match_explanation").contains("Invalid"), "UNMATCHED")
+     .when(F.col("match_confidence_score") >= 92, "CHILD")
+     .otherwise("PARENT")
+)
+
+display(df_final_org.select("src_company_name_raw", "childcompanyname", "match_explanation").limit(10))
+
