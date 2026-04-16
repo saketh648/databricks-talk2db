@@ -1,29 +1,61 @@
-from databricks.vector_search.client import VectorSearchClient
+import pyspark.sql.functions as F
 
-# 1. Initialize the Client
-vsc = VectorSearchClient()
+# 1. Configuration
+TABLE_ORG = "dev.mma_entityresolution.tbl_entityres_ach_org_names_match"
+TABLE_REC = "dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"
 
-# 2. Point to your DEV index
-# Note: Ensure your workspace has a Vector Search Endpoint running
-index = vsc.get_index(
-    endpoint_name="your_vector_search_endpoint", # Replace with your actual endpoint name
-    index_name="dev.er_sp_metadata.spg_entity_master_index"
-)
+# 2. Refined Repair Logic
+def apply_name_repair(df, raw_name_col):
+    """
+    Implements Methods 1, 2, and 3 logic from the requirements.
+    """
+    # Define noise and legal tokens
+    noise_tokens = ['ACH', 'WEB', 'PPD', 'CCD', 'CTX', 'PMT', 'PAY', 'PAYMENT', 'TRANSFER', 'TRANSACTION']
+    geo_tokens = ['ST', 'STREET', 'RD', 'ROAD', 'AVE', 'AVENUE', 'BLVD', 'STE', 'TX', 'MN', 'CA', 'NY', 'FL']
+    legal_suffixes = r"\b(INC|LLC|LTD|CO|COMPANY|CORP|CORPORATION|LP|LLP|PLC|PC|HOLDINGS)\b"
+    
+    # Method 1: Canonicalization (Upper, Strip Punctuation)
+    # Using the raw name provided by your specific column mapping
+    df = df.withColumn("src_company_name_raw", F.col(raw_name_col))
+    df = df.withColumn("src_company_name_canonical", F.upper(F.trim(F.col("src_company_name_raw"))))
+    df = df.withColumn("src_company_name_canonical", F.regexp_replace("src_company_name_canonical", r"[^A-Z0-9\s]", " "))
+    
+    # Remove noise/geo tokens
+    for token in noise_tokens + geo_tokens:
+        df = df.withColumn("src_company_name_canonical", 
+            F.regexp_replace("src_company_name_canonical", rf"\b{token}\b", ""))
 
-# 3. Test with a "Tricky" query (The U.S. Bank case)
-search_query = "U S BANK ANK" 
+    # Method 2: Abbreviation Expansion
+    abbrev_dict = {"USB ANK": "U S BANK", "US BANK": "U S BANK", "AMZN": "AMAZON", "CVS": "CVS PHARMACY", "WMT": "WALMART"}
+    mapping_expr = F.create_map([F.lit(x) for x in sum(abbrev_dict.items(), ())])
+    
+    df = df.withColumn("src_company_name_enriched", 
+        F.coalesce(mapping_expr[F.col("src_company_name_canonical")], F.col("src_company_name_canonical")))
+    
+    # Step 3: Normalization (Final string for Vector Search)
+    df = df.withColumn("src_company_name_normalized", 
+        F.trim(F.regexp_replace("src_company_name_enriched", legal_suffixes, "")))
+    
+    return df.withColumn("src_company_name_normalized", F.regexp_replace("src_company_name_normalized", r"\s+", " "))
 
-results = index.similarity_search(
-    query_text=search_query,
-    columns=["child_company_name", "parent_company_name", "city", "country"],
-    num_results=5
-)
+# 3. Process the ORG Table (5,000 rows)
+df_org = spark.table(TABLE_ORG)
+df_org_prepped = apply_name_repair(df_org, "originator_company_name") \
+    .withColumn("role_type", F.lit("ACH_ORIGINATION")) \
+    .select("sor_id", "role_type", "src_company_name_raw", "party_name_clean", "src_company_name_normalized")
 
-# 4. Display as a clean table
-import pandas as pd
-df_results = pd.DataFrame(
-    results['result']['data_array'], 
-    columns=["Child Name", "Parent Name", "City", "Country", "Score"]
-)
+# 4. Process the REC Table (5,000 rows)
+df_rec = spark.table(TABLE_REC)
+df_rec_prepped = apply_name_repair(df_rec, "dest_customer_nm") \
+    .withColumn("role_type", F.lit("ACH_RECEIVED")) \
+    .select("sor_id", "role_type", "src_company_name_raw", "party_name_clean", "src_company_name_normalized")
 
-display(df_results)
+# 5. Create Search Registry (Unique Names for talk2db_poc_endpoint)
+search_registry = df_org_prepped.select("src_company_name_normalized") \
+    .union(df_rec_prepped.select("src_company_name_normalized")) \
+    .distinct() \
+    .filter("src_company_name_normalized IS NOT NULL AND src_company_name_normalized != ''")
+
+print(f"Phase 1 Complete.")
+print(f"Total Source Rows: {df_org_prepped.count() + df_rec_prepped.count()}")
+print(f"Unique Search Candidates: {search_registry.count()}")
