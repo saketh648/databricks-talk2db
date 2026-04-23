@@ -21,6 +21,18 @@ def clean_names(df):
 df_org_clean = clean_names(df_org)
 df_rec_clean = clean_names(df_rec)
 
+
+# You need this block here so the notebook knows what registry_matches is
+# 1. Define your unique list from the source tables
+search_registry = df_org_clean.select("src_company_name_normalized") \
+    .union(df_rec_clean.select("src_company_name_normalized")) \
+    .distinct()
+
+# 2. Run the Vector Search to create the registry_matches dataframe
+# (Make sure your search_vector_worker_top3 function is also defined in this notebook)
+registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_top3, schema=result_schema).cache()
+
+
 # ==========================================
 # 2. SEMANTIC CACHE (THE SPEED FIX)
 # ==========================================
