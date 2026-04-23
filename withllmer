@@ -87,3 +87,43 @@ def finalize_and_save(df_clean, target_table):
 # Run for both
 finalize_and_save(df_org_clean, "entity_resolution_ach_origination")
 finalize_and_save(df_rec_clean, "entity_resolution_ach_received")
+
+
+
+
+# --- STEP 1: Define the Schema ---
+result_schema = StructType([
+    StructField("src_company_name_normalized", StringType(), True),
+    StructField("candidates_json", StringType(), True),
+    StructField("match_confidence_score", FloatType(), True),
+    StructField("top2_score", FloatType(), True)
+])
+
+# --- STEP 2: Define the Worker Function ---
+def search_vector_worker_top3(iterator):
+    import json
+    from databricks.vector_search.client import VectorSearchClient
+    vsc = VectorSearchClient()
+    # Ensure this index name is correct for your environment
+    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", 
+                         index_name="dev.er_sp_metadata.spg_entity_master_index")
+    
+    for pdf in iterator:
+        results = []
+        for name in pdf['src_company_name_normalized']:
+            try:
+                resp = index.similarity_search(query_text=name, 
+                                             columns=["childcompanyid", "childcompanyname", "companytypename"], 
+                                             num_results=3)
+                data = resp.get('result', {}).get('data_array', [])
+                candidates = [{"id": str(r[0]), "name": str(r[1]), "type": str(r[2]), "score": round(float(r[3])*100, 2)} for r in data]
+                
+                results.append({
+                    "src_company_name_normalized": name,
+                    "candidates_json": json.dumps(candidates),
+                    "match_confidence_score": candidates[0]['score'] if candidates else 0.0,
+                    "top2_score": candidates[1]['score'] if len(candidates) > 1 else 0.0
+                })
+            except Exception as e:
+                results.append({"src_company_name_normalized": name, "candidates_json": "[]", "match_confidence_score": 0.0, "top2_score": 0.0})
+        yield pd.DataFrame(results)
