@@ -1,0 +1,111 @@
+import pandas as pd
+import pyspark.sql.functions as F
+from pyspark.sql.types import *
+from databricks.vector_search.client import VectorSearchClient
+
+# ==========================================
+# 1. STANDARDIZED INGESTION (ID Fix)
+# ==========================================
+# We rename sor_id0 and originator/dest names to match a unified schema
+df_org = spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match") \
+    .withColumnRenamed("sor_id0", "sor_id") \
+    .withColumnRenamed("originator_company_name", "src_company_name_raw")
+
+df_rec = spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match") \
+    .withColumnRenamed("dest_customer_nm", "src_company_name_raw")
+
+def clean_names(df):
+    return df.withColumn("src_company_name_normalized", 
+        F.trim(F.regexp_replace(F.upper(F.col("src_company_name_raw")), r"[^\w\s]", "")))
+
+df_org_clean = clean_names(df_org)
+df_rec_clean = clean_names(df_rec)
+
+# Create the unique registry to minimize LLM calls (9,995 unique names)
+search_registry = df_org_clean.select("src_company_name_normalized") \
+    .union(df_rec_clean.select("src_company_name_normalized")) \
+    .distinct().filter("src_company_name_normalized != ''")
+
+# ==========================================
+# 2. VECTOR SEARCH (Worker Definition)
+# ==========================================
+result_schema = StructType([
+    StructField("src_company_name_normalized", StringType(), True),
+    StructField("candidates_json", StringType(), True),
+    StructField("match_confidence_score", FloatType(), True)
+])
+
+def search_vector_worker_top3(iterator):
+    import json
+    vsc = VectorSearchClient()
+    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", 
+                         index_name="dev.er_sp_metadata.spg_entity_master_index")
+    for pdf in iterator:
+        results = []
+        for name in pdf['src_company_name_normalized']:
+            try:
+                resp = index.similarity_search(query_text=name, columns=["childcompanyid", "childcompanyname"], num_results=3)
+                data = resp.get('result', {}).get('data_array', [])
+                candidates = [{"name": str(r[1]), "score": round(float(r[2])*100, 2)} for r in data]
+                results.append({
+                    "src_company_name_normalized": name,
+                    "candidates_json": json.dumps(candidates),
+                    "match_confidence_score": candidates[0]['score'] if candidates else 0.0
+                })
+            except:
+                results.append({"src_company_name_normalized": name, "candidates_json": "[]", "match_confidence_score": 0.0})
+        yield pd.DataFrame(results)
+
+# Cache the registry matches (Run this first)
+registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_top3, schema=result_schema).cache()
+
+# ==========================================
+# 3. LLM RERANKING (Strict Format)
+# ==========================================
+prompt_logic = """
+format_string(
+    "Task: Select the best legal match. Input: %s | Candidates: %s. 
+     Rule: If no match, say 'Invalid'. 
+     Format: [TARGET_NAME]: name | [MATCH_REASON]: reason", 
+    src_company_name_normalized, candidates_json
+)
+"""
+
+# Call Maverick only on UNIQUE names to save 16 mins
+# We include the match_confidence_score so it's not 'unresolved'
+answer_key = registry_matches.repartition(200).withColumn("llm_raw", 
+    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '60', 'temperature', '0'))")
+).cache()
+
+# ==========================================
+# 4. FINAL MAPPING & CLEANUP
+# ==========================================
+def finalize_and_save(df_clean, target_table):
+    # Join the answer key back to the full dataset
+    df_final = df_clean.join(answer_key, on="src_company_name_normalized", how="left")
+    
+    # Clean extraction: Handles Maverick's "wordiness" and removes markdown stars
+    df_final = df_final.withColumn("childcompanyname", 
+        F.when(F.col("match_confidence_score") < 75, F.lit("No Clear Match"))
+         .otherwise(F.regexp_replace(F.regexp_extract("llm_raw", r"\[TARGET_NAME\]:\s*([^|\]\n]+)", 1), r"\*", ""))) \
+                       .withColumn("match_explanation", 
+        F.when(F.col("match_confidence_score") < 75, F.lit("Low vector score; manual review suggested."))
+         .otherwise(F.regexp_extract("llm_raw", r"\[MATCH_REASON\]:\s*(.*)", 1)))
+
+    # Match Level Logic
+    df_final = df_final.withColumn("match_level", 
+        F.when(F.col("childcompanyname").isin("Invalid", "No Clear Match") | F.col("llm_raw").isNull(), "UNMATCHED")
+         .when(F.col("match_confidence_score") >= 92, "CHILD")
+         .otherwise("PARENT"))
+
+    # Final Table Write
+    final_cols = ["sor_id", "src_company_name_raw", "childcompanyname", "match_level", "match_explanation"]
+    df_final.select(final_cols).write.format("delta").mode("overwrite") \
+            .option("overwriteSchema", "true") \
+            .saveAsTable(f"dev.mma_entityresolution.{target_table}")
+    
+    print(f"✅ Success: Created dev.mma_entityresolution.{target_table}")
+
+# Execute
+finalize_and_save(df_org_clean, "entity_resolution_ach_origination_llm")
+finalize_and_save(df_rec_clean, "entity_resolution_ach_received_llm")
