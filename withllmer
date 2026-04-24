@@ -3,8 +3,9 @@ import pyspark.sql.functions as F
 from pyspark.sql.types import *
 from databricks.vector_search.client import VectorSearchClient
 
-# --- STEP 1: ULTRA-CLEANER (Preserving the Raw Name) ---
+# --- STEP 1: CLEANING (Explicitly defining src_company_name_raw) ---
 def ultra_clean(df, name_col):
+    # This line ensures the original column name exists throughout the pipeline
     return df.withColumn("src_company_name_raw", F.col(name_col)) \
              .withColumn("name_clean", 
         F.initcap(F.trim(
@@ -15,21 +16,21 @@ def ultra_clean(df, name_col):
         ))
     )
 
-# Clear cache to avoid schema ghosting
+# Force clear cache to reset the schema in Spark's memory
 spark.catalog.clearCache()
 
 # Ingest and Clean
 df_org = ultra_clean(spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match").withColumnRenamed("sor_id0", "sor_id"), "originator_company_name")
 df_rec = ultra_clean(spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"), "dest_customer_nm")
 
-# --- STEP 2: HYBRID VECTOR WORKER ---
+# --- STEP 2: VECTOR SEARCH ---
 result_schema = StructType([
     StructField("name_clean", StringType(), True),
     StructField("candidates_json", StringType(), True),
     StructField("raw_vector_score", FloatType(), True)
 ])
 
-def search_vector_worker_v8(iterator):
+def search_vector_worker_v9(iterator):
     import json
     vsc = VectorSearchClient()
     index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", index_name="dev.er_sp_metadata.spg_entity_master_index")
@@ -37,6 +38,7 @@ def search_vector_worker_v8(iterator):
         results = []
         for name in pdf['name_clean']:
             try:
+                # Top 10 retrieval to ensure accuracy for messy ACH data
                 resp = index.similarity_search(query_text=name, columns=["childcompanyname"], num_results=10)
                 data = resp.get('result', {}).get('data_array', [])
                 candidates = [{"name": str(r[1]), "score": round(float(r[-1]), 4)} for r in data]
@@ -49,51 +51,51 @@ def search_vector_worker_v8(iterator):
                 results.append({"name_clean": name, "candidates_json": "[]", "raw_vector_score": 0.0})
         yield pd.DataFrame(results)
 
+# Create registry of unique cleaned names
 search_registry = df_org.select("name_clean").union(df_rec.select("name_clean")).distinct()
-registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_v8, schema=result_schema).cache()
+registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_v9, schema=result_schema).cache()
 
 # --- STEP 3: LLM REASONING LAYER ---
 prompt_logic = """
 format_string(
-    "### ROLE: Expert Entity Resolver.
-     INPUT: '%s' | CANDIDATES: %s
-     TASK: Identify the real legal entity. Look past the noisy transaction IDs.
-     FORMAT: MATCHED_NAME: <name> | EXPLANATION: <reason>", 
+    "Identify the legal parent entity for: '%s'. Candidates: %s.
+     Ignore numbers and transaction junk.
+     FORMAT: [MATCH]: <name> | [EXPLANATION]: <reason>", 
     name_clean, candidates_json
 )
 """
 
 answer_key = registry_matches.repartition(100).withColumn("llm_raw", 
-    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '125', 'concurrency', '20'))")
+    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '150', 'concurrency', '20'))")
 ).cache()
 
-# --- STEP 4: FINAL ASSEMBLY (FIXED SELECT) ---
+# --- STEP 4: FINAL ASSEMBLY (Ensuring all columns are resolved) ---
 def finalize_and_save(df_clean, target_table):
-    # Joining results back to the original cleaned dataframe
+    # Ensure we join on name_clean to bring original columns into df_final
     df_final = df_clean.join(registry_matches, on="name_clean", how="left") \
                        .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
     
-    # Extract AI Answer
-    df_final = df_final.withColumn("matched_name_extracted", 
-        F.regexp_replace(F.regexp_extract("llm_raw", r"MATCHED_NAME:\s*([^|]+)", 1), r"[\*\[\]]", "")) \
+    # Extract AI Answer and Explanation
+    df_final = df_final.withColumn("child_name_raw", 
+        F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1), r"[\*\[\]]", "")) \
                        .withColumn("match_explanation", 
-        F.regexp_extract("llm_raw", r"EXPLANATION:\s*(.*)", 1))
+        F.regexp_extract("llm_raw", r"\[EXPLANATION\]:\s*(.*)", 1))
 
-    # Recovery logic
+    # Standardize childcompanyname - Fallback to Vector Search if LLM failed
     df_final = df_final.withColumn("childcompanyname", 
-        F.when(F.col("matched_name_extracted") != "", F.col("matched_name_extracted"))
+        F.when(F.col("child_name_raw") != "", F.col("child_name_raw"))
          .when(F.col("raw_vector_score") > 0.8, F.get_json_object(F.col("candidates_json"), "$[0].name"))
          .otherwise(F.lit("No Clear Match")))
 
-    # Final selection - ensuring all columns exist
+    # THE FINAL SELECTION: Using exact names to avoid 'UNRESOLVED_COLUMN'
     final_cols = ["sor_id", "src_company_name_raw", "childcompanyname", "match_explanation"]
     
     df_final.select(final_cols).write.format("delta").mode("overwrite") \
             .option("overwriteSchema", "true") \
             .saveAsTable(f"dev.mma_entityresolution.{target_table}")
     
-    print(f"✅ Success: {target_table} created successfully.")
+    print(f"✅ Success: Updated {target_table}")
 
-# Run for both
+# Run the execution
 finalize_and_save(df_org, "entity_resolution_ach_origination_llm")
 finalize_and_save(df_rec, "entity_resolution_ach_received_llm")
