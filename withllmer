@@ -3,128 +3,96 @@ import pyspark.sql.functions as F
 from pyspark.sql.types import *
 from databricks.vector_search.client import VectorSearchClient
 
-# --- STEP 0: INITIALIZATION & CACHE CLEAR ---
-# We clear the catalog to ensure we aren't inheriting "Splitfy" or "Plaid" errors from old runs
+# --- STEP 0: RESET CACHE ---
 spark.catalog.clearCache()
 
-# --- STEP 1: STANDARDIZED INGESTION ---
-# Handling the sor_id0 mismatch here by aliasing
-df_org = spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match") \
-    .withColumnRenamed("sor_id0", "sor_id") \
-    .withColumnRenamed("originator_company_name", "src_company_name_raw")
-
-df_rec = spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match") \
-    .withColumnRenamed("dest_customer_nm", "src_company_name_raw")
-
-def enterprise_normalize(df):
-    # Aggressive prefix stripping and Title Casing to align with S&P Global Index
+# --- STEP 1: PURE ENTITY EXTRACTION ---
+def heavy_duty_clean(df, name_col):
     return df.withColumn("name_clean", 
-        F.initcap(F.trim(F.regexp_replace(
-            F.regexp_replace(F.upper(F.col("src_company_name_raw")), r"^#[A-Z0-9]{3,4}\s+", ""), 
-            r"[^\w\s]", ""
-        )))
+        F.initcap(F.trim(
+            # 1. Strip leading # followed by any digits or letters (e.g. #785946 or #BUE)
+            # 2. Strip any leading digits alone (e.g. 1291RA0923)
+            # 3. Strip trailing junk like 'DEFAULT' or 'LLC' for searching purposes
+            F.regexp_replace(
+                F.regexp_replace(F.upper(F.col(name_col)), r"^(#[A-Z0-9]+\s+|[0-9]+\s+)", ""), 
+                r"[^\w\s]", ""
+            )
+        ))
     )
 
-df_org_clean = enterprise_normalize(df_org)
-df_rec_clean = enterprise_normalize(df_rec)
+df_org = heavy_duty_clean(spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match").withColumnRenamed("sor_id0", "sor_id"), "originator_company_name")
+df_rec = heavy_duty_clean(spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"), "dest_customer_nm")
 
-# --- STEP 2: HYBRID VECTOR WORKER (Dynamic Boosting) ---
+# --- STEP 2: DYNAMIC VECTOR SEARCH ---
 result_schema = StructType([
     StructField("name_clean", StringType(), True),
     StructField("candidates_json", StringType(), True),
     StructField("match_confidence_score", FloatType(), True)
 ])
 
-def search_vector_worker_dynamic(iterator):
+def search_vector_worker_v6(iterator):
     import json
     vsc = VectorSearchClient()
-    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", 
-                         index_name="dev.er_sp_metadata.spg_entity_master_index")
-    
+    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", index_name="dev.er_sp_metadata.spg_entity_master_index")
     for pdf in iterator:
         results = []
         for name in pdf['name_clean']:
             try:
-                # 1. Broad Retrieval: Pull 10 candidates to ensure the 'real' target is present
-                resp = index.similarity_search(query_text=name, num_results=10)
+                # We pull 15 candidates now. With noisy data, the real match is often buried.
+                resp = index.similarity_search(query_text=name, num_results=15)
                 data = resp.get('result', {}).get('data_array', [])
                 
-                # 2. Dynamic Similarity Scoring:
-                # We boost candidates that contain the first word of the input (e.g., 'Tesla')
-                # This prevents unrelated high-vector scores (like 'Plaid') from winning.
-                scored_candidates = []
-                input_root = name.split()[0].upper() if name else ""
-                
+                # Boost logic: If a candidate name contains the FIRST WORD of our clean input
+                # (e.g. 'Compsource' from '#1001965 COMPSOURCE'), we rank it #1.
+                first_word = name.split()[0].upper() if name else ""
+                processed = []
                 for r in data:
                     c_name = str(r[1])
-                    v_score = float(r[-1])
-                    # Boost if the core brand name is present
-                    boost = 1.25 if input_root in c_name.upper() else 1.0
-                    scored_candidates.append({"name": c_name, "score": round(v_score * 100 * boost, 2)})
+                    v_score = float(r[-1]) * 100
+                    boost = 1.3 if first_word and first_word in c_name.upper() else 1.0
+                    processed.append({"name": c_name, "score": round(v_score * boost, 2)})
                 
-                # Re-sort based on the boosted logic
-                scored_candidates = sorted(scored_candidates, key=lambda x: x['score'], reverse=True)
-                
-                results.append({
-                    "name_clean": name,
-                    "candidates_json": json.dumps(scored_candidates[:5]),
-                    "match_confidence_score": scored_candidates[0]['score']
-                })
-            except Exception:
+                sorted_p = sorted(processed, key=lambda x: x['score'], reverse=True)
+                results.append({"name_clean": name, "candidates_json": json.dumps(sorted_p[:5]), "match_confidence_score": sorted_p[0]['score']})
+            except:
                 results.append({"name_clean": name, "candidates_json": "[]", "match_confidence_score": 0.0})
         yield pd.DataFrame(results)
 
-# Create unique registry
-search_registry = df_org_clean.select("name_clean").union(df_rec_clean.select("name_clean")).distinct()
-registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_dynamic, schema=result_schema).cache()
+search_registry = df_org.select("name_clean").union(df_rec.select("name_clean")).distinct()
+registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_v6, schema=result_schema).cache()
 
-# --- STEP 3: CONSTRAINED LLM RERANKING ---
-# We force the LLM to explain the structural match to prevent hallucinations
+# --- STEP 3: REASONING LAYER ---
 prompt_logic = """
 format_string(
-    "### INSTRUCTION: Compare Input: '%s' against Candidates: %s.
-     ### RULES:
-     1. Prioritize phonetic and structural similarity of the core brand.
-     2. If no candidate reliably represents the legal entity of the input, return 'UNMATCHED'.
-     3. Do not assume subsidiaries (e.g. Plaid) are the parent for unrelated brands (e.g. Tesla).
-     ### FORMAT: [MATCH]: <name> | [REASON]: <reason>", 
+    "### ROLE: Expert Auditor. 
+     INPUT: '%s' | CANDIDATES: %s.
+     TASK: Find the real legal entity. 
+     RULES: Ignore transaction codes/numbers. If the company is clearly 'Compsource' or 'Velocity', pick the global parent.
+     FORMAT: [MATCH]: <name> | [REASON]: <short reason>", 
     name_clean, candidates_json
 )
 """
 
-answer_key = registry_matches.filter("match_confidence_score >= 70").repartition(100).withColumn("llm_raw", 
-    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '120', 'concurrency', '20'))")
+# We lower threshold slightly to 65 to catch these noisy but valid records
+answer_key = registry_matches.filter("match_confidence_score >= 65").repartition(100).withColumn("llm_raw", 
+    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '100', 'concurrency', '20'))")
 ).cache()
 
-# --- STEP 4: FINAL ASSEMBLY & QUALITY CONTROL ---
+# --- STEP 4: FINAL ASSEMBLY ---
 def finalize_and_save(df_clean, target_table):
     df_final = df_clean.join(registry_matches, on="name_clean", how="left") \
                        .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
     
-    # Extract AI decision
     df_final = df_final.withColumn("childcompanyname", 
-        F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1), r"[\*\[\]]", "")) \
+        F.when(F.col("match_confidence_score") < 65, F.lit("No Clear Match"))
+         .otherwise(F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1), r"[\*\[\]]", ""))) \
                        .withColumn("match_explanation", 
-        F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1))
+        F.when(F.col("match_confidence_score") < 65, F.lit("No confident candidates found in master registry."))
+         .otherwise(F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1)))
 
-    # Standardize result mapping
-    df_final = df_final.withColumn("childcompanyname", 
-        F.when(F.col("childcompanyname").contains("UNMATCHED") | F.col("childcompanyname").isNull() | (F.col("childcompanyname") == ""), 
-               F.lit("No Clear Match"))
-         .otherwise(F.trim(F.col("childcompanyname"))))
-
-    # Match Level Logic
-    df_final = df_final.withColumn("match_level", 
-        F.when(F.col("childcompanyname") == "No Clear Match", "UNMATCHED").otherwise("PARENT"))
-
-    # Final Select and Write
-    final_cols = ["sor_id", "src_company_name_raw", "childcompanyname", "match_level", "match_explanation"]
-    df_final.select(final_cols).write.format("delta").mode("overwrite") \
-            .option("overwriteSchema", "true") \
+    df_final.select("sor_id", "src_company_name_raw", "childcompanyname", "match_explanation") \
+            .write.format("delta").mode("overwrite").option("overwriteSchema", "true") \
             .saveAsTable(f"dev.mma_entityresolution.{target_table}")
-    
-    print(f"✅ Enterprise Pipeline Complete: {target_table}")
 
-# Execute for both datasets
-finalize_and_save(df_org_clean, "entity_resolution_ach_origination_llm")
-finalize_and_save(df_rec_clean, "entity_resolution_ach_received_llm")
+finalize_and_save(df_org, "entity_resolution_ach_origination_llm")
+finalize_and_save(df_rec, "entity_resolution_ach_received_llm")
