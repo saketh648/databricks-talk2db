@@ -1,5 +1,5 @@
 # ============================================================
-# ENTERPRISE ENTITY RESOLUTION - OPTIMIZED & FIXED
+# ENTERPRISE ENTITY RESOLUTION - VECTOR SEARCH FIXED
 # ============================================================
 
 import pandas as pd
@@ -8,23 +8,57 @@ from pyspark.sql.types import *
 from databricks.vector_search.client import VectorSearchClient
 
 # ============================================================
-# STEP 1: FAST CLEANER - Strip prefixes, normalize names
+# STEP 1: SMARTER CLEANER
+# Extracts the REAL brand keyword from ACH transaction strings
+# e.g. "#BUE SPLITWISE" → "Splitwise"
+#      "#KGP PLAID APP" → "Plaid"
+#      "#XUB TESLA PLAID" → "Tesla"
 # ============================================================
 
 def enterprise_normalize(df, name_col, id_col="sor_id"):
     return (
         df.withColumn("src_company_name_raw", F.col(name_col))
-          .withColumn("name_clean",
-              F.initcap(F.trim(
-                  F.regexp_replace(
-                      F.regexp_replace(
-                          F.upper(F.col(name_col)),
-                          r"^(#[A-Z0-9]+\s+|\d+[A-Z]*\s+)", ""   # strip leading codes
-                      ),
-                      r"(?i)\b(DEFAULT|LLC|INC|CORP|LTD|SERVICES|S\.P\.A|B\.V|K\.K)\b", ""
-                  )
+
+          # Step A: uppercase for processing
+          .withColumn("_upper", F.upper(F.col(name_col)))
+
+          # Step B: strip leading ACH transaction prefix (#BUE, #KGP, 1291RA0923 etc.)
+          .withColumn("_stripped",
+              F.trim(F.regexp_replace(
+                  F.col("_upper"),
+                  r"^(#[A-Z0-9]+\s+|[0-9]+[A-Z0-9]*\s+)", ""
               ))
           )
+
+          # Step C: remove known ACH suffixes/noise words that are NOT the brand
+          #   "PLAID APP" → "PLAID"  |  "TESLA PLAID" → "TESLA"  |  "ARRIVED HOM" → stripped
+          .withColumn("_denoised",
+              F.trim(F.regexp_replace(
+                  F.col("_stripped"),
+                  r"(?i)\b(APP|APPS|PLATFORM|PAYMENT|PAYMENTS|PAY|ARRIVED|HOM|HOME|"
+                  r"DEFAULT|LLC|INC|CORP|LTD|SERVICES|S\.P\.A|B\.V|K\.K|"
+                  # KEY FIX: "PLAID" is a product of Plaid Inc, not a company itself
+                  # "TESLA PLAID" → remove "PLAID" suffix when preceded by another word
+                  r"PLAID(?=\s*$))\b",  # remove trailing PLAID only
+                  ""
+              ))
+          )
+
+          # Step D: extract just the FIRST meaningful word as the primary search term
+          # "SPLITWISE" → "Splitwise"
+          # "DOUBLE GOOD" → "Double Good"  (keep multi-word if no noise)
+          .withColumn("name_clean",
+              F.initcap(F.trim(F.col("_denoised")))
+          )
+
+          # Step E: also keep a single-keyword fallback for retry searches
+          .withColumn("name_keyword",
+              F.initcap(F.trim(
+                  F.regexp_extract(F.col("_denoised"), r"^(\S+)", 1)
+              ))
+          )
+
+          .drop("_upper", "_stripped", "_denoised")
           .withColumnRenamed(id_col, "sor_id")
     )
 
@@ -40,15 +74,27 @@ df_rec = enterprise_normalize(
 )
 
 # ============================================================
-# STEP 2: VECTOR SEARCH - Unique names only, fixed column mapping
+# STEP 2: VECTOR SEARCH - Dual search strategy
+# Search 1: full cleaned name  e.g. "Splitwise"
+# Search 2: keyword only       e.g. "Splitwise" (fallback if Search 1 weak)
+# Merge both, deduplicate, pick best candidates
 # ============================================================
 
 result_schema = StructType([
-    StructField("name_clean",        StringType(), True),
-    StructField("candidates_json",   StringType(), True),
-    StructField("raw_vector_score",  FloatType(),  True),
-    StructField("top_candidate_name", StringType(), True),   # NEW: store name separately
+    StructField("name_clean",         StringType(), True),
+    StructField("name_keyword",       StringType(), True),
+    StructField("candidates_json",    StringType(), True),
+    StructField("raw_vector_score",   FloatType(),  True),
+    StructField("top_candidate_name", StringType(), True),
 ])
+
+def is_valid_company_name(name: str) -> bool:
+    """Reject pure numeric strings or very short garbage."""
+    if not name or len(name.strip()) < 2:
+        return False
+    # Reject if >70% digits
+    digits = sum(c.isdigit() for c in name)
+    return (digits / len(name)) < 0.7
 
 def search_vector_worker(iterator):
     import json
@@ -60,46 +106,82 @@ def search_vector_worker(iterator):
 
     for pdf in iterator:
         results = []
-        names   = pdf["name_clean"].tolist()
 
-        # Batch as many as the SDK allows; fall back to one-by-one
-        for name in names:
+        for _, row in pdf.iterrows():
+            name_clean   = row["name_clean"]
+            name_keyword = row["name_keyword"]
+
             try:
-                resp = index.similarity_search(
-                    query_text=name,
-                    columns=["childcompanyname"],   # only the name column
-                    num_results=15
+                # ── Search 1: full cleaned name
+                resp1 = index.similarity_search(
+                    query_text=name_clean,
+                    columns=["childcompanyname"],
+                    num_results=10
                 )
-                data_array = resp.get("result", {}).get("data_array", [])
 
-                # ── FIX: data_array row = [childcompanyname, score]
-                #    (one requested column + score always appended last)
-                first_word = name.split()[0].upper() if name else ""
-                processed  = []
-                for row in data_array:
-                    c_name  = str(row[0])          # ← FIXED: index 0, not 1
-                    v_score = float(row[-1])        # score is always last
-                    # skip obviously numeric/garbage names
-                    if c_name.replace(".", "").replace("-", "").isdigit():
-                        continue
-                    boost = 1.3 if first_word and first_word in c_name.upper() else 1.0
-                    processed.append({
-                        "name":  c_name,
-                        "score": round(v_score * 100 * boost, 2)
-                    })
+                # ── Search 2: keyword only (catches "Splitwise" when full string weak)
+                # Only run if keyword differs from full name
+                resp2_data = []
+                if name_keyword and name_keyword.lower() != name_clean.lower():
+                    resp2 = index.similarity_search(
+                        query_text=name_keyword,
+                        columns=["childcompanyname"],
+                        num_results=10
+                    )
+                    resp2_data = resp2.get("result", {}).get("data_array", [])
 
-                processed.sort(key=lambda x: x["score"], reverse=True)
+                data1 = resp1.get("result", {}).get("data_array", [])
+
+                # ── Merge both result sets, deduplicate by name
+                seen    = {}
+                keyword = name_keyword.upper() if name_keyword else ""
+                full_kw = name_clean.upper()   if name_clean   else ""
+
+                for source_data, weight in [(data1, 1.0), (resp2_data, 0.95)]:
+                    for r in source_data:
+                        c_name  = str(r[0]).strip()   # index 0 = childcompanyname
+                        v_score = float(r[-1])         # last = similarity score
+
+                        if not is_valid_company_name(c_name):
+                            continue
+
+                        # Boost: candidate contains our keyword or vice versa
+                        c_upper = c_name.upper()
+                        if keyword and keyword in c_upper:
+                            boost = 1.4   # strong match: "Splitwise" in "Splitwise Inc"
+                        elif full_kw and full_kw in c_upper:
+                            boost = 1.3
+                        elif keyword and c_upper in keyword:
+                            boost = 1.2   # reverse containment
+                        else:
+                            boost = 1.0
+
+                        final_score = round(v_score * 100 * boost * weight, 2)
+
+                        # Keep best score if name seen from both searches
+                        if c_name not in seen or final_score > seen[c_name]:
+                            seen[c_name] = final_score
+
+                # Sort and take top 5
+                processed = [
+                    {"name": n, "score": s}
+                    for n, s in sorted(seen.items(), key=lambda x: x[1], reverse=True)
+                ][:5]
+
                 top = processed[0] if processed else None
 
                 results.append({
-                    "name_clean":         name,
-                    "candidates_json":    json.dumps(processed[:5]),
+                    "name_clean":         name_clean,
+                    "name_keyword":       name_keyword,
+                    "candidates_json":    json.dumps(processed),
                     "raw_vector_score":   top["score"] if top else 0.0,
                     "top_candidate_name": top["name"]  if top else "",
                 })
+
             except Exception as e:
                 results.append({
-                    "name_clean":         name,
+                    "name_clean":         name_clean,
+                    "name_keyword":       name_keyword,
                     "candidates_json":    "[]",
                     "raw_vector_score":   0.0,
                     "top_candidate_name": "",
@@ -108,45 +190,47 @@ def search_vector_worker(iterator):
         yield pd.DataFrame(results)
 
 
-# Only process unique names → huge speed gain
+# Unique name pairs to avoid redundant searches
 search_registry = (
-    df_org.select("name_clean")
-    .union(df_rec.select("name_clean"))
+    df_org.select("name_clean", "name_keyword")
+    .union(df_rec.select("name_clean", "name_keyword"))
     .distinct()
-    .filter(F.col("name_clean").isNotNull() & (F.col("name_clean") != ""))
+    .filter(
+        F.col("name_clean").isNotNull() &
+        (F.length(F.trim(F.col("name_clean"))) > 1)
+    )
 )
 
 registry_matches = (
     search_registry
-    .repartition(60)                          # tuned for typical cluster size
+    .repartition(60)
     .mapInPandas(search_vector_worker, schema=result_schema)
     .cache()
 )
-
-# Eagerly materialise so the cache is warm before LLM calls
-registry_matches.count()
+registry_matches.count()  # materialise cache
 
 # ============================================================
-# STEP 3: LLM REASONING - Fixed prompt, proper Spark SQL string
+# STEP 3: LLM - Prompt now explicitly handles PLAID/TESLA cases
 # ============================================================
 
-# Build prompt as a Spark column (no Python f-string interpolation inside SQL)
 prompt_expr = F.concat_ws("",
     F.lit(
-        "You are an entity resolution expert for ACH payment data.\n"
-        "Strip any leading transaction codes (e.g. #BUE, #HCK, numbers) from the input.\n"
-        "Pick the BEST matching real company brand from the candidates.\n"
-        "If none match, output UNMATCHED.\n\n"
+        "You are an ACH payment entity resolution expert.\n"
+        "ACH transaction names often contain noise: prefix codes (#BUE, #KGP), "
+        "product names (PLAID=payment product, not a company), "
+        "or partial brand names.\n\n"
     ),
-    F.lit("INPUT: "),      F.col("name_clean"),
-    F.lit("\nCANDIDATES: "), F.col("candidates_json"),
+    F.lit("ORIGINAL ACH NAME: "), F.col("name_clean"),
+    F.lit("\nCANDIDATES: "),       F.col("candidates_json"),
     F.lit(
-        "\n\nRULES:\n"
-        "- Choose the candidate whose brand name best matches the input.\n"
-        "- Ignore numeric-only candidates — they are not valid company names.\n"
-        "- 'PLAID APP' → 'Plaid', 'TESLA PLAID' → 'Tesla', 'ETSY' → 'Etsy'\n"
-        "- If no candidate is a recognisable real company, output UNMATCHED.\n\n"
-        "RESPOND ONLY IN THIS FORMAT (no extra text):\n"
+        "\n\nRULES (apply in order):\n"
+        "1. PLAID is a payment infrastructure product — the company is 'Plaid Inc'.\n"
+        "2. 'TESLA PLAID' refers to Tesla (car), not Plaid the company.\n"
+        "3. 'SPLITWISE' → match 'Splitwise Inc' if in candidates.\n"
+        "4. Match the candidate whose brand name best represents the ACH input.\n"
+        "5. Ignore numeric-only or UUID-like candidates entirely.\n"
+        "6. If truly no match, output UNMATCHED.\n\n"
+        "RESPOND IN THIS FORMAT ONLY:\n"
         "[MATCH]: <company name or UNMATCHED> | [REASON]: <one sentence>"
     )
 )
@@ -161,28 +245,25 @@ answer_key = (
             "ai_query("
             "  'databricks-llama-4-maverick',"
             "  prompt,"
-            "  map('max_tokens', '120', 'temperature', '0')"   # temp=0 → deterministic
+            "  map('max_tokens', '120', 'temperature', '0')"
             ")"
         )
     )
     .cache()
 )
-
-answer_key.count()   # materialise
+answer_key.count()
 
 # ============================================================
-# STEP 4: PARSE LLM OUTPUT + FINAL ASSEMBLY
+# STEP 4: FINAL ASSEMBLY
 # ============================================================
 
 def finalize_and_save(df_clean, target_table):
-    # Join pre-computed registry + answers back to source
     df_final = (
         df_clean
         .join(registry_matches, on="name_clean", how="left")
         .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
     )
 
-    # Extract [MATCH] and [REASON] safely
     df_final = (
         df_final
         .withColumn("matched_name_extracted",
@@ -196,23 +277,19 @@ def finalize_and_save(df_clean, target_table):
         )
     )
 
-    # ── FIXED resolution logic:
-    #    1. Valid LLM match  → use it
-    #    2. High-confidence vector AND name is not numeric → use top_candidate_name
-    #    3. Otherwise → No Clear Match
     df_final = df_final.withColumn(
         "childcompanyname",
         F.when(
             F.col("matched_name_extracted").isNotNull()
-            & (F.col("matched_name_extracted") != "")
+            & (F.length(F.col("matched_name_extracted")) > 1)
             & (F.upper(F.col("matched_name_extracted")) != "UNMATCHED"),
             F.col("matched_name_extracted")
         )
+        # Fallback: high-confidence vector hit with valid name
         .when(
             (F.col("raw_vector_score") > 90)
             & F.col("top_candidate_name").isNotNull()
-            & (F.col("top_candidate_name") != "")
-            # Guard: reject pure-numeric names from vector search
+            & (F.length(F.col("top_candidate_name")) > 1)
             & (~F.col("top_candidate_name").rlike(r"^[\d\.\-]+$")),
             F.col("top_candidate_name")
         )
@@ -222,8 +299,7 @@ def finalize_and_save(df_clean, target_table):
     final_cols = ["sor_id", "src_company_name_raw", "childcompanyname", "match_explanation"]
 
     (
-        df_final
-        .select(final_cols)
+        df_final.select(final_cols)
         .write.format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
@@ -231,6 +307,7 @@ def finalize_and_save(df_clean, target_table):
     )
     print(f"✅ Done → dev.mma_entityresolution.{target_table}")
 
-# ── Execute ──────────────────────────────────────────────────
+
+# ── Execute ─────────────────────────────────────────────────
 finalize_and_save(df_org, "entity_resolution_ach_origination_llm")
 finalize_and_save(df_rec, "entity_resolution_ach_received_llm")
