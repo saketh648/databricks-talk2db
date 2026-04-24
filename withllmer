@@ -1,118 +1,236 @@
+# ============================================================
+# ENTERPRISE ENTITY RESOLUTION - OPTIMIZED & FIXED
+# ============================================================
+
 import pandas as pd
 import pyspark.sql.functions as F
 from pyspark.sql.types import *
 from databricks.vector_search.client import VectorSearchClient
 
-# --- STEP 1: ULTRA-CLEANER ---
-# Preserves the raw name while creating a high-fidelity 'search string'
-def enterprise_normalize(df, name_col):
-    return df.withColumn("src_company_name_raw", F.col(name_col)) \
-             .withColumn("name_clean", 
-        F.initcap(F.trim(
-            F.regexp_replace(
-                F.regexp_replace(F.upper(F.col(name_col)), r"^(#[A-Z0-9]+\s+|[0-9]+\s+|[0-9]+[A-Z]+\s+)", ""), 
-                r"(?i)\b(DEFAULT|LLC|INC|CORP|LTD|SERVICES|S.P.A|B.V|K.K)\b", ""
-            )
-        ))
+# ============================================================
+# STEP 1: FAST CLEANER - Strip prefixes, normalize names
+# ============================================================
+
+def enterprise_normalize(df, name_col, id_col="sor_id"):
+    return (
+        df.withColumn("src_company_name_raw", F.col(name_col))
+          .withColumn("name_clean",
+              F.initcap(F.trim(
+                  F.regexp_replace(
+                      F.regexp_replace(
+                          F.upper(F.col(name_col)),
+                          r"^(#[A-Z0-9]+\s+|\d+[A-Z]*\s+)", ""   # strip leading codes
+                      ),
+                      r"(?i)\b(DEFAULT|LLC|INC|CORP|LTD|SERVICES|S\.P\.A|B\.V|K\.K)\b", ""
+                  )
+              ))
+          )
+          .withColumnRenamed(id_col, "sor_id")
     )
 
-# Force clear cache to reset Spark's execution plan
 spark.catalog.clearCache()
 
-# Ingest source tables
-df_org = enterprise_normalize(spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match").withColumnRenamed("sor_id0", "sor_id"), "originator_company_name")
-df_rec = enterprise_normalize(spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"), "dest_customer_nm")
+df_org = enterprise_normalize(
+    spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match"),
+    "originator_company_name", id_col="sor_id0"
+)
+df_rec = enterprise_normalize(
+    spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"),
+    "dest_customer_nm"
+)
 
-# --- STEP 2: VECTOR SEARCH (Unique Entities Only) ---
-# This is the 'Efficiency' engine: we only query unique clean names.
+# ============================================================
+# STEP 2: VECTOR SEARCH - Unique names only, fixed column mapping
+# ============================================================
+
 result_schema = StructType([
-    StructField("name_clean", StringType(), True),
-    StructField("candidates_json", StringType(), True),
-    StructField("raw_vector_score", FloatType(), True)
+    StructField("name_clean",        StringType(), True),
+    StructField("candidates_json",   StringType(), True),
+    StructField("raw_vector_score",  FloatType(),  True),
+    StructField("top_candidate_name", StringType(), True),   # NEW: store name separately
 ])
 
-def search_vector_worker_production(iterator):
+def search_vector_worker(iterator):
     import json
-    vsc = VectorSearchClient()
-    index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", index_name="dev.er_sp_metadata.spg_entity_master_index")
+    vsc   = VectorSearchClient()
+    index = vsc.get_index(
+        endpoint_name="talk2db_poc_endpoint",
+        index_name="dev.er_sp_metadata.spg_entity_master_index"
+    )
+
     for pdf in iterator:
         results = []
-        for name in pdf['name_clean']:
+        names   = pdf["name_clean"].tolist()
+
+        # Batch as many as the SDK allows; fall back to one-by-one
+        for name in names:
             try:
-                # Top 15 retrieval ensures we don't miss the parent in messy ACH data
-                resp = index.similarity_search(query_text=name, columns=["childcompanyname"], num_results=15)
-                data = resp.get('result', {}).get('data_array', [])
-                
-                # Dynamic Scoring: Prioritize candidates that share the first word of our query
+                resp = index.similarity_search(
+                    query_text=name,
+                    columns=["childcompanyname"],   # only the name column
+                    num_results=15
+                )
+                data_array = resp.get("result", {}).get("data_array", [])
+
+                # ── FIX: data_array row = [childcompanyname, score]
+                #    (one requested column + score always appended last)
                 first_word = name.split()[0].upper() if name else ""
-                processed = []
-                for r in data:
-                    c_name = str(r[1])
-                    v_score = float(r[-1])
-                    # Boost score if brand name matches structurally
+                processed  = []
+                for row in data_array:
+                    c_name  = str(row[0])          # ← FIXED: index 0, not 1
+                    v_score = float(row[-1])        # score is always last
+                    # skip obviously numeric/garbage names
+                    if c_name.replace(".", "").replace("-", "").isdigit():
+                        continue
                     boost = 1.3 if first_word and first_word in c_name.upper() else 1.0
-                    processed.append({"name": c_name, "score": round(v_score * 100 * boost, 2)})
-                
-                sorted_p = sorted(processed, key=lambda x: x['score'], reverse=True)
+                    processed.append({
+                        "name":  c_name,
+                        "score": round(v_score * 100 * boost, 2)
+                    })
+
+                processed.sort(key=lambda x: x["score"], reverse=True)
+                top = processed[0] if processed else None
+
                 results.append({
-                    "name_clean": name, 
-                    "candidates_json": json.dumps(sorted_p[:5]), 
-                    "raw_vector_score": sorted_p[0]['score'] if sorted_p else 0.0
+                    "name_clean":         name,
+                    "candidates_json":    json.dumps(processed[:5]),
+                    "raw_vector_score":   top["score"] if top else 0.0,
+                    "top_candidate_name": top["name"]  if top else "",
                 })
-            except:
-                results.append({"name_clean": name, "candidates_json": "[]", "raw_vector_score": 0.0})
+            except Exception as e:
+                results.append({
+                    "name_clean":         name,
+                    "candidates_json":    "[]",
+                    "raw_vector_score":   0.0,
+                    "top_candidate_name": "",
+                })
+
         yield pd.DataFrame(results)
 
-# Create a master registry of unique names to avoid redundant AI calls
-search_registry = df_org.select("name_clean").union(df_rec.select("name_clean")).distinct()
-registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_production, schema=result_schema).cache()
 
-# --- STEP 3: CONSTRAINED AI REASONING ---
-prompt_logic = """
-format_string(
-    "### TASK: Identify the Legal Parent Entity.
-     INPUT: '%s' | CANDIDATES: %s
-     RULES: 
-     - Ignore transaction codes and numbers.
-     - Choose the candidate that is the actual brand (e.g. Tesla vs Plaid).
-     - If no match is clear, output 'UNMATCHED'.
-     FORMAT: [MATCH]: <name> | [REASON]: <short reason>", 
-    name_clean, candidates_json
+# Only process unique names → huge speed gain
+search_registry = (
+    df_org.select("name_clean")
+    .union(df_rec.select("name_clean"))
+    .distinct()
+    .filter(F.col("name_clean").isNotNull() & (F.col("name_clean") != ""))
 )
-"""
 
-# Only call the LLM for entities that need reasoning (No filter for max coverage)
-answer_key = registry_matches.repartition(100).withColumn("llm_raw", 
-    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '150', 'concurrency', '24'))")
-).cache()
+registry_matches = (
+    search_registry
+    .repartition(60)                          # tuned for typical cluster size
+    .mapInPandas(search_vector_worker, schema=result_schema)
+    .cache()
+)
 
-# --- STEP 4: FINAL ASSEMBLY ---
+# Eagerly materialise so the cache is warm before LLM calls
+registry_matches.count()
+
+# ============================================================
+# STEP 3: LLM REASONING - Fixed prompt, proper Spark SQL string
+# ============================================================
+
+# Build prompt as a Spark column (no Python f-string interpolation inside SQL)
+prompt_expr = F.concat_ws("",
+    F.lit(
+        "You are an entity resolution expert for ACH payment data.\n"
+        "Strip any leading transaction codes (e.g. #BUE, #HCK, numbers) from the input.\n"
+        "Pick the BEST matching real company brand from the candidates.\n"
+        "If none match, output UNMATCHED.\n\n"
+    ),
+    F.lit("INPUT: "),      F.col("name_clean"),
+    F.lit("\nCANDIDATES: "), F.col("candidates_json"),
+    F.lit(
+        "\n\nRULES:\n"
+        "- Choose the candidate whose brand name best matches the input.\n"
+        "- Ignore numeric-only candidates — they are not valid company names.\n"
+        "- 'PLAID APP' → 'Plaid', 'TESLA PLAID' → 'Tesla', 'ETSY' → 'Etsy'\n"
+        "- If no candidate is a recognisable real company, output UNMATCHED.\n\n"
+        "RESPOND ONLY IN THIS FORMAT (no extra text):\n"
+        "[MATCH]: <company name or UNMATCHED> | [REASON]: <one sentence>"
+    )
+)
+
+answer_key = (
+    registry_matches
+    .withColumn("prompt", prompt_expr)
+    .repartition(120)
+    .withColumn(
+        "llm_raw",
+        F.expr(
+            "ai_query("
+            "  'databricks-llama-4-maverick',"
+            "  prompt,"
+            "  map('max_tokens', '120', 'temperature', '0')"   # temp=0 → deterministic
+            ")"
+        )
+    )
+    .cache()
+)
+
+answer_key.count()   # materialise
+
+# ============================================================
+# STEP 4: PARSE LLM OUTPUT + FINAL ASSEMBLY
+# ============================================================
+
 def finalize_and_save(df_clean, target_table):
-    # Join the master registry and AI answers back to the original source data
-    df_final = df_clean.join(registry_matches, on="name_clean", how="left") \
-                       .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
-    
-    # Extract AI response
-    df_final = df_final.withColumn("matched_name_extracted", 
-        F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1), r"[\*\[\]]", "")) \
-                       .withColumn("match_explanation", 
-        F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1))
+    # Join pre-computed registry + answers back to source
+    df_final = (
+        df_clean
+        .join(registry_matches, on="name_clean", how="left")
+        .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
+    )
 
-    # Standardize result: Use LLM result, fallback to Vector Search if very high confidence
-    df_final = df_final.withColumn("childcompanyname", 
-        F.when(F.col("matched_name_extracted") != "UNMATCHED", F.col("matched_name_extracted"))
-         .when(F.col("raw_vector_score") > 90, F.get_json_object(F.col("candidates_json"), "$[0].name"))
-         .otherwise(F.lit("No Clear Match")))
+    # Extract [MATCH] and [REASON] safely
+    df_final = (
+        df_final
+        .withColumn("matched_name_extracted",
+            F.trim(F.regexp_replace(
+                F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1),
+                r"[\*\[\]\"']", ""
+            ))
+        )
+        .withColumn("match_explanation",
+            F.trim(F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1))
+        )
+    )
 
-    # Final Write: Explicitly selecting required columns to prevent 'Unresolved Column' errors
+    # ── FIXED resolution logic:
+    #    1. Valid LLM match  → use it
+    #    2. High-confidence vector AND name is not numeric → use top_candidate_name
+    #    3. Otherwise → No Clear Match
+    df_final = df_final.withColumn(
+        "childcompanyname",
+        F.when(
+            F.col("matched_name_extracted").isNotNull()
+            & (F.col("matched_name_extracted") != "")
+            & (F.upper(F.col("matched_name_extracted")) != "UNMATCHED"),
+            F.col("matched_name_extracted")
+        )
+        .when(
+            (F.col("raw_vector_score") > 90)
+            & F.col("top_candidate_name").isNotNull()
+            & (F.col("top_candidate_name") != "")
+            # Guard: reject pure-numeric names from vector search
+            & (~F.col("top_candidate_name").rlike(r"^[\d\.\-]+$")),
+            F.col("top_candidate_name")
+        )
+        .otherwise(F.lit("No Clear Match"))
+    )
+
     final_cols = ["sor_id", "src_company_name_raw", "childcompanyname", "match_explanation"]
-    
-    df_final.select(final_cols).write.format("delta").mode("overwrite") \
-            .option("overwriteSchema", "true") \
-            .saveAsTable(f"dev.mma_entityresolution.{target_table}")
-    
-    print(f"✅ Success: Processed {target_table}")
 
-# Execute
+    (
+        df_final
+        .select(final_cols)
+        .write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(f"dev.mma_entityresolution.{target_table}")
+    )
+    print(f"✅ Done → dev.mma_entityresolution.{target_table}")
+
+# ── Execute ──────────────────────────────────────────────────
 finalize_and_save(df_org, "entity_resolution_ach_origination_llm")
 finalize_and_save(df_rec, "entity_resolution_ach_received_llm")
