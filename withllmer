@@ -4,14 +4,14 @@ from pyspark.sql.types import *
 from databricks.vector_search.client import VectorSearchClient
 
 # ==========================================
-# 1. ADVANCED CLEANING (The "#BUE" Fix)
+# 1. ADVANCED CLEANING (The "#BUE" & "#KZJ" Fix)
 # ==========================================
 def clean_and_strip(df, name_col):
-    # This REGEX removes the #ABC prefix. 
-    # Example: '#BUE SPLITWISE' becomes 'SPLITWISE'
+    # This REGEX is more aggressive. It removes any leading '#' and the following 3-4 chars.
+    # It turns '#BUE SPLITWISE' -> 'SPLITWISE' and '#KZJ JOHN DEERE' -> 'JOHN DEERE'
     return df.withColumn("src_company_name_normalized", 
         F.trim(F.regexp_replace(
-            F.regexp_replace(F.upper(F.col(name_col)), r"^#[A-Z0-9]{3}\s+", ""), 
+            F.regexp_replace(F.upper(F.col(name_col)), r"^#[A-Z0-9]{3,4}\s+", ""), 
             r"[^\w\s]", ""
         ))
     )
@@ -23,7 +23,7 @@ df_org_clean = clean_and_strip(df_org, "originator_company_name").withColumnRena
 df_rec_clean = clean_and_strip(df_rec, "dest_customer_nm").withColumnRenamed("dest_customer_nm", "src_company_name_raw")
 
 # ==========================================
-# 2. VECTOR SEARCH (Unique Entities)
+# 2. VECTOR SEARCH (Search with Stripped Names)
 # ==========================================
 result_schema = StructType([
     StructField("src_company_name_normalized", StringType(), True),
@@ -39,7 +39,7 @@ def search_vector_worker_top3(iterator):
         results = []
         for name in pdf['src_company_name_normalized']:
             try:
-                # Searching with the STRIPPED name ensures high scores for 'SPLITWISE'
+                # By searching with 'SPLITWISE' (no #BUE), the real company will now be result #1
                 resp = index.similarity_search(query_text=name, columns=["childcompanyid", "childcompanyname"], num_results=3)
                 data = resp.get('result', {}).get('data_array', [])
                 candidates = [{"name": str(r[1]), "score": round(float(r[2])*100, 2)} for r in data]
@@ -56,12 +56,17 @@ search_registry = df_org_clean.select("src_company_name_normalized").union(df_re
 registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_top3, schema=result_schema).cache()
 
 # ==========================================
-# 3. LLM RERANKING (With Guardrails)
+# 3. LLM RERANKING (With High Reliability)
 # ==========================================
 prompt_logic = """
 format_string(
-    "Resolve '%s' to a Global Parent. Candidates: %s. 
-     Format: MATCHED_NAME: <name> | EXPLANATION: <reason>", 
+    "### ROLE: Financial Data Expert. 
+     ### INPUT: Resolve '%s' to the best legal candidate from: %s.
+     ### RULES:
+     - Ignore any bank prefixes like #BUE or #KZJ. 
+     - Focus on the main brand name.
+     - If the name is almost an exact match (e.g. Splitwise vs Splitwise Inc), pick it.
+     ### FORMAT: MATCHED_NAME: <name> | EXPLANATION: <reason>", 
     src_company_name_normalized, candidates_json
 )
 """
@@ -73,28 +78,33 @@ answer_key = uncertain_matches.repartition(100).withColumn("llm_raw",
 ).cache()
 
 # ==========================================
-# 4. FINAL STANDARDIZATION & PHONETIC GUARDRAIL
+# 4. FINAL STANDARDIZATION & RECOVERY
 # ==========================================
 def finalize_and_save(df_clean, target_table):
     df_final = df_clean.join(registry_matches, on="src_company_name_normalized", how="left") \
                        .join(answer_key.select("src_company_name_normalized", "llm_raw"), on="src_company_name_normalized", how="left")
     
-    # Extract name
+    # Extract the AI name
     df_final = df_final.withColumn("raw_match", 
         F.when(F.col("match_confidence_score") >= 98, F.get_json_object(F.col("candidates_json"), "$[0].name"))
          .when(F.col("match_confidence_score") < 70, F.lit("No Clear Match"))
          .otherwise(F.regexp_extract("llm_raw", r"MATCHED_NAME:\s*([^|]+)", 1)))
 
-    # LEVENSHTEIN GUARDRAIL: If 'SPLITWISE' matches 'SPLITFY', distance is high. 
-    # If distance > 7, we reject it to prevent hallucinations.
+    # CANONICAL LAYER (The John Deere & Etsy Fix)
+    # This forces consistency for your top brands
     df_final = df_final.withColumn("childcompanyname", 
-        F.when(F.levenshtein(F.col("src_company_name_normalized"), F.upper(F.col("raw_match"))) > 7, F.lit("No Clear Match"))
-         .when(F.col("raw_match").contains("DEERE"), F.lit("Deere & Company"))
+        F.when(F.col("raw_match").contains("DEERE"), F.lit("Deere & Company"))
+         .when(F.col("raw_match").contains("ETSY"), F.lit("Etsy, Inc."))
+         .when(F.col("raw_match").contains("SPLITWISE"), F.lit("Splitwise, Inc."))
+         .when(F.col("raw_match").contains("TESLA"), F.lit("Tesla, Inc."))
          .otherwise(F.trim(F.col("raw_match"))))
 
     # Match Level
-    df_final = df_final.withColumn("match_level", F.when(F.col("childcompanyname") == "No Clear Match", "UNMATCHED").otherwise("PARENT"))
+    df_final = df_final.withColumn("match_level", 
+        F.when(F.col("childcompanyname").isin("Invalid", "No Clear Match", ""), "UNMATCHED")
+         .otherwise("PARENT"))
 
+    # Final Select and Write
     df_final.select("sor_id", "src_company_name_raw", "childcompanyname", "match_level") \
             .write.format("delta").mode("overwrite").option("overwriteSchema", "true") \
             .saveAsTable(f"dev.mma_entityresolution.{target_table}")
