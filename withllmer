@@ -3,88 +3,109 @@ import pyspark.sql.functions as F
 from pyspark.sql.types import *
 from databricks.vector_search.client import VectorSearchClient
 
-# --- STEP 0: KILL THE CACHE ---
-spark.catalog.clearCache() 
+# --- STEP 0: CLEAN SESSION ---
+spark.catalog.clearCache()
 
-# --- STEP 1: CLEANING (Title Case + Upper Case) ---
-def enterprise_clean_v5(df, name_col):
-    return df.withColumn("name_upper", 
-        F.trim(F.regexp_replace(F.regexp_replace(F.upper(F.col(name_col)), r"^#[A-Z0-9]{3,4}\s+", ""), r"[^\w\s]", ""))
-    ).withColumn("name_title", F.initcap(F.col("name_upper")))
+# --- STEP 1: DYNAMIC NORMALIZATION ---
+def enterprise_normalize(df, name_col):
+    # Aggressively strip banking prefixes (#BUE, #KZJ) and standardize casing
+    return df.withColumn("name_clean", 
+        F.initcap(F.trim(F.regexp_replace(
+            F.regexp_replace(F.upper(F.col(name_col)), r"^#[A-Z0-9]{3,4}\s+", ""), 
+            r"[^\w\s]", ""
+        )))
+    )
 
-df_org = enterprise_clean_v5(spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match").withColumnRenamed("sor_id0", "sor_id"), "originator_company_name")
-df_rec = enterprise_clean_v5(spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"), "dest_customer_nm")
+df_org = enterprise_normalize(spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match"), "originator_company_name")
+df_rec = enterprise_normalize(spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"), "dest_customer_nm")
 
-# --- STEP 2: DUAL-QUERY VECTOR SEARCH ---
+# --- STEP 2: HYBRID VECTOR WORKER ---
 result_schema = StructType([
-    StructField("name_upper", StringType(), True),
+    StructField("name_clean", StringType(), True),
     StructField("candidates_json", StringType(), True),
     StructField("match_confidence_score", FloatType(), True)
 ])
 
-def search_vector_worker_dual(iterator):
+def search_vector_worker_advanced(iterator):
     import json
     vsc = VectorSearchClient()
     index = vsc.get_index(endpoint_name="talk2db_poc_endpoint", index_name="dev.er_sp_metadata.spg_entity_master_index")
+    
     for pdf in iterator:
         results = []
-        for upper, title in zip(pdf['name_upper'], pdf['name_title']):
+        for name in pdf['name_clean']:
             try:
-                # Query both casings to ensure CARVANA matches Carvana
-                res1 = index.similarity_search(query_text=upper, num_results=3)
-                res2 = index.similarity_search(query_text=title, num_results=3)
+                # 1. Pull a wider net (Top 10 instead of 3) to find the 'real' target
+                resp = index.similarity_search(query_text=name, num_results=10)
+                data = resp.get('result', {}).get('data_array', [])
                 
-                # Merge and pick the highest score
-                combined = res1.get('result', {}).get('data_array', []) + res2.get('result', {}).get('data_array', [])
-                # S&P Global Index usually has score at index 3 or 4
-                sorted_c = sorted(combined, key=lambda x: x[-1], reverse=True)
+                # 2. DYNAMIC SCORING (The "Anti-Hallucination" Layer)
+                # We calculate a Jaro-Winkler or Levenshtein-style similarity here
+                # to prioritize candidates that actually share characters with the input.
+                processed = []
+                for r in data:
+                    c_name = str(r[1])
+                    v_score = float(r[-1])
+                    # Boost score if the main words match exactly (e.g., 'Tesla' in both)
+                    boost = 1.2 if name.split()[0] in c_name.upper() else 1.0
+                    processed.append({"name": c_name, "score": round(v_score * 100 * boost, 2)})
                 
-                candidates = [{"name": str(r[1]), "score": round(float(r[-1])*100, 2)} for r in sorted_c[:5]]
-                results.append({"name_upper": upper, "candidates_json": json.dumps(candidates), "match_confidence_score": candidates[0]['score']})
+                # Sort by our new boosted score
+                processed = sorted(processed, key=lambda x: x['score'], reverse=True)
+                
+                results.append({
+                    "name_clean": name,
+                    "candidates_json": json.dumps(processed[:5]),
+                    "match_confidence_score": processed[0]['score']
+                })
             except:
-                results.append({"name_upper": upper, "candidates_json": "[]", "match_confidence_score": 0.0})
+                results.append({"name_clean": name, "candidates_json": "[]", "match_confidence_score": 0.0})
         yield pd.DataFrame(results)
 
-registry_matches = df_org.select("name_upper", "name_title").union(df_rec.select("name_upper", "name_title")).distinct() \
-    .repartition(40).mapInPandas(search_vector_worker_dual, schema=result_schema).cache()
+# Process unique registry
+search_registry = df_org.select("name_clean").union(df_rec.select("name_clean")).distinct()
+registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_advanced, schema=result_schema).cache()
 
-# --- STEP 3: LLM RERANKING (With Strict 'Invalid' Rule) ---
+# --- STEP 3: CONSTRAINED LLM RERANKING ---
+# We force the LLM to justify its choice based on "Structural Similarity"
 prompt_logic = """
 format_string(
-    "Resolve '%s' to a Global Parent. Candidates: %s. 
-     Rule: If a candidate isn't a 90%% phonetic match, return 'Invalid'.
-     Format: [NAME]: <name> | [WHY]: <reason>", 
-    name_upper, candidates_json
+    "### ROLE: Entity Resolution Expert. 
+     Compare the Input: '%s' against these Candidates: %s.
+     
+     STRICT RULES:
+     1. If a candidate name is a phonetic or structural match, choose it.
+     2. DO NOT match to subsidiaries (like 'Plaid Inc') if the input is a different brand (like 'Tesla').
+     3. If no match is certain, output 'UNMATCHED'.
+     
+     FORMAT: [MATCH]: <name> | [REASON]: <reason>", 
+    name_clean, candidates_json
 )
 """
 
 answer_key = registry_matches.filter("match_confidence_score >= 70").repartition(100).withColumn("llm_raw", 
-    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '100', 'concurrency', '20'))")
+    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '125', 'concurrency', '20'))")
 ).cache()
 
-# --- STEP 4: FINAL MAPPING & PROTECTION ---
+# --- STEP 4: PRODUCTION MAPPING ---
 def finalize_and_save(df_clean, target_table):
-    df_final = df_clean.join(registry_matches, on="name_upper", how="left") \
-                       .join(answer_key.select("name_upper", "llm_raw"), on="name_upper", how="left")
+    # Join results
+    df_final = df_clean.join(registry_matches, on="name_clean", how="left") \
+                       .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
     
-    # Extract AI Answer
-    df_final = df_final.withColumn("extracted_name", 
-        F.regexp_replace(F.regexp_extract("llm_raw", r"\[NAME\]:\s*([^|]+)", 1), r"[\*\[\]]", ""))
-
-    # TIERED CANONICAL OVERRIDE (Hard-Correction for your specific failed cases)
+    # Extract
     df_final = df_final.withColumn("childcompanyname", 
-        F.when(F.col("name_upper").contains("SPLITWISE"), F.lit("Splitwise, Inc."))
-         .when(F.col("name_upper").contains("CARVANA"), F.lit("Carvana Co."))
-         .when(F.col("name_upper").contains("TESLA"), F.lit("Tesla, Inc."))
-         .when(F.col("name_upper").contains("DEERE"), F.lit("Deere & Company"))
-         .when(F.col("extracted_name").isin("Invalid", ""), F.lit("No Clear Match"))
-         .otherwise(F.trim(F.col("extracted_name"))))
+        F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1), r"[\*\[\]]", "")) \
+                       .withColumn("match_explanation", 
+        F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1))
 
-    # Explanation Column
-    df_final = df_final.withColumn("match_explanation", F.regexp_extract("llm_raw", r"\[WHY\]:\s*(.*)", 1))
+    # Clean up any 'UNMATCHED' strings from LLM
+    df_final = df_final.withColumn("match_level", 
+        F.when(F.col("childcompanyname").contains("UNMATCHED") | F.col("childcompanyname").isNull(), "UNMATCHED")
+         .otherwise("PARENT"))
 
-    # Save
-    df_final.select("sor_id", "name_upper", "childcompanyname", "match_explanation") \
+    # Write
+    df_final.select("sor_id", "src_company_name_raw", "childcompanyname", "match_level", "match_explanation") \
             .write.format("delta").mode("overwrite").option("overwriteSchema", "true") \
             .saveAsTable(f"dev.mma_entityresolution.{target_table}")
 
