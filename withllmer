@@ -3,11 +3,9 @@ import pyspark.sql.functions as F
 from pyspark.sql.types import *
 from databricks.vector_search.client import VectorSearchClient
 
-# --- STEP 0: RESET CACHE ---
-spark.catalog.clearCache()
-
-# --- STEP 1: CLEANING (Keeping the Raw Column) ---
-def ultra_clean_fixed(df, name_col):
+# --- STEP 1: CLEANING (Ensuring 'src_company_name_raw' is preserved) ---
+def ultra_clean(df, name_col):
+    # We keep the original name_col by aliasing it clearly
     return df.withColumn("src_company_name_raw", F.col(name_col)) \
              .withColumn("name_clean", 
         F.initcap(F.trim(
@@ -18,10 +16,14 @@ def ultra_clean_fixed(df, name_col):
         ))
     )
 
-df_org = ultra_clean_fixed(spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match").withColumnRenamed("sor_id0", "sor_id"), "originator_company_name")
-df_rec = ultra_clean_fixed(spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"), "dest_customer_nm")
+# Clear cache to avoid schema ghosting
+spark.catalog.clearCache()
 
-# --- STEP 2: HYBRID VECTOR WORKER ---
+# Ingest and Clean
+df_org = ultra_clean(spark.table("dev.mma_entityresolution.tbl_entityres_ach_org_names_match").withColumnRenamed("sor_id0", "sor_id"), "originator_company_name")
+df_rec = ultra_clean(spark.table("dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"), "dest_customer_nm")
+
+# --- STEP 2: VECTOR SEARCH ---
 result_schema = StructType([
     StructField("name_clean", StringType(), True),
     StructField("candidates_json", StringType(), True),
@@ -48,49 +50,50 @@ def search_vector_worker_v8(iterator):
                 results.append({"name_clean": name, "candidates_json": "[]", "raw_vector_score": 0.0})
         yield pd.DataFrame(results)
 
-search_registry = df_org.select("name_clean").union(df_rec.select("name_clean")).distinct().filter("name_clean IS NOT NULL")
+search_registry = df_org.select("name_clean").union(df_rec.select("name_clean")).distinct()
 registry_matches = search_registry.repartition(40).mapInPandas(search_vector_worker_v8, schema=result_schema).cache()
 
-# --- STEP 3: LLM RERANKING ---
+# --- STEP 3: LLM REASONING ---
 prompt_logic = """
 format_string(
-    "Resolve Input: '%s' | Candidates: %s. 
-     Pick the best global entity. If none fit, say 'UNMATCHED'.
-     FORMAT: MATCHED_NAME: <name> | EXPLANATION: <reason>", 
+    "Resolve '%s' to a Global Parent. Candidates: %s. 
+     Format: MATCHED_NAME: <name> | EXPLANATION: <reason>", 
     name_clean, candidates_json
 )
 """
 
 answer_key = registry_matches.repartition(100).withColumn("llm_raw", 
-    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '120', 'concurrency', '20'))")
+    F.expr(f"ai_query('databricks-llama-4-maverick', {prompt_logic}, map('max_tokens', '125', 'concurrency', '20'))")
 ).cache()
 
-# --- STEP 4: FINAL ASSEMBLY (Column Fix Applied) ---
+# --- STEP 4: FINAL ASSEMBLY (FIXED) ---
 def finalize_and_save(df_clean, target_table):
-    # Join on 'name_clean'
+    # We join registry_matches and answer_key to the cleaned source
     df_final = df_clean.join(registry_matches, on="name_clean", how="left") \
                        .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
     
-    # Extract and standardize
-    df_final = df_final.withColumn("childcompanyname", 
+    # Extract AI results
+    df_final = df_final.withColumn("matched_name_extracted", 
         F.regexp_replace(F.regexp_extract("llm_raw", r"MATCHED_NAME:\s*([^|]+)", 1), r"[\*\[\]]", "")) \
                        .withColumn("match_explanation", 
         F.regexp_extract("llm_raw", r"EXPLANATION:\s*(.*)", 1))
 
-    # Fallback for empty strings
+    # Recovery Logic
     df_final = df_final.withColumn("childcompanyname", 
-        F.when(F.col("childcompanyname") == "", F.lit("No Clear Match"))
-         .otherwise(F.col("childcompanyname")))
+        F.when(F.col("matched_name_extracted") != "", F.col("matched_name_extracted"))
+         .when(F.col("raw_vector_score") > 0.8, F.get_json_object(F.col("candidates_json"), "$[0].name"))
+         .otherwise(F.lit("No Clear Match")))
 
-    # THE FIX: Explicitly selecting sor_id and src_company_name_raw
+    # THE FIX: Ensure we select exactly what exists in the dataframe
+    # We use coalesce to handle any possible missing values before writing
     final_cols = ["sor_id", "src_company_name_raw", "childcompanyname", "match_explanation"]
     
     df_final.select(final_cols).write.format("delta").mode("overwrite") \
             .option("overwriteSchema", "true") \
             .saveAsTable(f"dev.mma_entityresolution.{target_table}")
     
-    print(f"✅ Table {target_table} successfully created.")
+    print(f"✅ Success: {target_table} created.")
 
-# Run execution
+# RUN
 finalize_and_save(df_org, "entity_resolution_ach_origination_llm")
 finalize_and_save(df_rec, "entity_resolution_ach_received_llm")
