@@ -1,0 +1,228 @@
+import pyspark.sql.functions as F
+
+TABLE_ORG = "dev.mma_entityresolution.tbl_entityres_ach_org_names_match"
+TABLE_REC = "dev.mma_entityresolution.tbl_entityres_ach_rec_names_match"
+
+def apply_name_repair(df, raw_name_col):
+    """
+    Canonicalize -> Expand Abbreviations -> Normalize -> Title Case for vector search.
+    """
+
+    # --- Noise tokens that are safe to strip (ACH transaction metadata only) ---
+    # REMOVED geo tokens like ST, AVE, etc. — they corrupt real company names
+    noise_tokens = [
+        'ACH', 'WEB', 'PPD', 'CCD', 'CTX',
+        'PMT', 'PAY', 'PAYMENT', 'TRANSFER', 'TRANSACTION'
+    ]
+
+    legal_suffixes = r"\b(INC|LLC|LTD|CO|COMPANY|CORP|CORPORATION|LP|LLP|PLC|PC|HOLDINGS)\b"
+
+    # --- Method 1: Canonicalize ---
+    df = df.withColumn("src_company_name_raw", F.col(raw_name_col))
+    df = df.withColumn(
+        "src_company_name_canonical",
+        F.upper(F.trim(F.col("src_company_name_raw")))
+    )
+    # Strip punctuation except spaces
+    df = df.withColumn(
+        "src_company_name_canonical",
+        F.regexp_replace("src_company_name_canonical", r"[^A-Z0-9\s]", "")
+    )
+
+    # Strip noise tokens (word-boundary safe)
+    for token in noise_tokens:
+        df = df.withColumn(
+            "src_company_name_canonical",
+            F.regexp_replace("src_company_name_canonical", rf"\b{token}\b", "")
+        )
+
+    # Collapse extra whitespace after removals
+    df = df.withColumn(
+        "src_company_name_canonical",
+        F.trim(F.regexp_replace("src_company_name_canonical", r"\s+", " "))
+    )
+
+    # --- Method 2: Abbreviation Expansion (mid-string safe via regexp_replace) ---
+    abbrev_map = {
+        r"\bUSB ANK\b":  "US Bank",
+        r"\bUS BANK\b":  "US Bank",
+        r"\bUSBANK\b":   "US Bank",
+        r"\bAMZN\b":     "Amazon",
+        r"\bWMT\b":      "Walmart",
+        r"\bTGT\b":      "Target",
+        r"\bCVS\b":      "CVS Pharmacy",
+        r"\bHD\b":       "Home Depot",
+        r"\bMCD\b":      "McDonalds",
+        r"\bJD\b":       "John Deere",  # Add domain-specific ones you know
+    }
+
+    df = df.withColumn("src_company_name_enriched", F.col("src_company_name_canonical"))
+    for pattern, replacement in abbrev_map.items():
+        df = df.withColumn(
+            "src_company_name_enriched",
+            F.regexp_replace("src_company_name_enriched", pattern, replacement)
+        )
+
+    # --- Method 3: Strip legal suffixes and re-trim ---
+    df = df.withColumn(
+        "src_company_name_normalized",
+        F.trim(F.regexp_replace("src_company_name_enriched", legal_suffixes, ""))
+    )
+    df = df.withColumn(
+        "src_company_name_normalized",
+        F.trim(F.regexp_replace("src_company_name_normalized", r"\s+", " "))
+    )
+
+    # --- FIX: Convert to Title Case for vector index compatibility ---
+    # Vector indexes are typically built on "John Deere" not "JOHN DEERE"
+    df = df.withColumn(
+        "src_company_name_normalized",
+        F.initcap(F.col("src_company_name_normalized"))
+    )
+
+    return df
+
+
+# --- Process ORG Table ---
+df_org = spark.table(TABLE_ORG)
+df_org_prepped = apply_name_repair(df_org, "originator_company_name") \
+    .withColumn("role_type", F.lit("ACH_ORIGINATION")) \
+    .select("sor_id0", "role_type", "src_company_name_raw", "party_name_clean", "src_company_name_normalized")
+
+# --- Process REC Table ---
+df_rec = spark.table(TABLE_REC)
+df_rec_prepped = apply_name_repair(df_rec, "dest_customer_nm") \
+    .withColumn("role_type", F.lit("ACH_RECEIVED")) \
+    .select("sor_id", "role_type", "src_company_name_raw", "party_name_clean", "src_company_name_normalized")
+
+# --- Build Unique Search Registry ---
+search_registry = df_org_prepped.select("src_company_name_normalized") \
+    .union(df_rec_prepped.select("src_company_name_normalized")) \
+    .distinct() \
+    .filter(
+        F.col("src_company_name_normalized").isNotNull() &
+        (F.col("src_company_name_normalized") != "")
+    )
+
+org_count = df_org_prepped.count()
+rec_count = df_rec_prepped.count()
+registry_count = search_registry.count()
+
+print(f"Phase 1 Complete.")
+print(f"  ORG rows       : {org_count:,}")
+print(f"  REC rows       : {rec_count:,}")
+print(f"  Total rows     : {org_count + rec_count:,}")
+print(f"  Unique names   : {registry_count:,}")
+
+
+
+
+from pyspark.sql.types import *
+import pyspark.sql.functions as F
+import pandas as pd
+
+result_schema = StructType([
+    StructField("src_company_name_normalized", StringType(), True),
+    StructField("childcompanyname",            StringType(), True),
+    StructField("childcompanyid",              StringType(), True),
+    StructField("companytypename",             StringType(), True),
+    StructField("match_confidence_score",      FloatType(),  True),
+    StructField("top2_score",                  FloatType(),  True),
+])
+
+ENDPOINT  = "talk2db_poc_endpoint"
+INDEX     = "dev.er_sp_metadata.spg_entity_master_index"
+COLUMNS   = ["childcompanyid", "childcompanyname", "companytypename"]
+
+def search_vector_worker(iterator):
+    """
+    Runs on each Spark worker partition. Client is initialized once per partition.
+    """
+    vsc   = VectorSearchClient()
+    index = vsc.get_index(endpoint_name=ENDPOINT, index_name=INDEX)
+
+    for pdf in iterator:
+        results = []
+
+        for name in pdf["src_company_name_normalized"]:
+            if not name or not name.strip():
+                results.append({
+                    "src_company_name_normalized": name,
+                    "childcompanyname": None, "childcompanyid": None,
+                    "companytypename": None, "match_confidence_score": 0.0, "top2_score": 0.0
+                })
+                continue
+
+            try:
+                resp = index.similarity_search(
+                    query_text=name,          # Now Title Case — matches index
+                    columns=COLUMNS,
+                    num_results=2
+                )
+                data = resp.get("result", {}).get("data_array", [])
+
+                if data:
+                    top1       = data[0]
+                    top2_score = float(data[1][3]) * 100 if len(data) > 1 else 0.0
+                    results.append({
+                        "src_company_name_normalized": name,
+                        "childcompanyname":        str(top1[1]),
+                        "childcompanyid":          str(top1[0]),
+                        "companytypename":         str(top1[2]),
+                        "match_confidence_score":  round(float(top1[3]) * 100, 4),
+                        "top2_score":              round(top2_score, 4),
+                    })
+                else:
+                    results.append({
+                        "src_company_name_normalized": name,
+                        "childcompanyname": None, "childcompanyid": None,
+                        "companytypename": None, "match_confidence_score": 0.0, "top2_score": 0.0
+                    })
+
+            except Exception as e:
+                results.append({
+                    "src_company_name_normalized": name,
+                    "childcompanyname": f"ERROR: {str(e)[:80]}",
+                    "childcompanyid": None, "companytypename": None,
+                    "match_confidence_score": 0.0, "top2_score": 0.0,
+                })
+
+        yield pd.DataFrame(results, columns=[f.name for f in result_schema.fields])
+
+
+# --- Repartition to balance load across workers (tune to your cluster) ---
+PARTITIONS = 20  # ~250 names/partition for a 5k registry
+search_registry_partitioned = search_registry.repartition(PARTITIONS)
+
+# --- Execute distributed search ---
+final_matches_registry = search_registry_partitioned.mapInPandas(
+    search_vector_worker, schema=result_schema
+)
+
+# --- Decision Rules ---
+final_matches_registry = final_matches_registry.withColumn(
+    "match_level",
+    F.when(
+        (F.col("match_confidence_score") >= 92) &
+        ((F.col("match_confidence_score") - F.col("top2_score")) >= 3),
+        "CHILD"
+    ).when(
+        F.col("match_confidence_score") >= 85, "PARENT"
+    ).otherwise("UNMATCHED")
+).cache()
+
+# --- Join back to source tables ---
+final_org_results = df_org_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
+final_rec_results = df_rec_prepped.join(final_matches_registry, on="src_company_name_normalized", how="left")
+
+# --- Diagnostic: check match level distribution ---
+print("Match level breakdown:")
+final_matches_registry.groupBy("match_level").count().orderBy("count", ascending=False).show()
+
+display(final_org_results.select(
+    "src_company_name_raw",
+    "src_company_name_normalized",
+    "childcompanyname",
+    "match_confidence_score",
+    "match_level"
+))
