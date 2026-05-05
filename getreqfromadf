@@ -1,34 +1,34 @@
 {
-  "QueryConfig": {
-    "QueryType": "SQL",
-    "Expression": "SELECT Name, Brand, Price, Stock FROM BlobStorage WHERE Category = 'Electronics' AND Stock > 500 AND Availability = 'in_stock'"
-  },
-  "InputSerialization": { "CsvSettings": { "Header": "true" } },
-  "OutputSerialization": { "CsvSettings": { "Header": "true" } }
+  "x-ms-version": "2020-04-08",
+  "x-ms-date": "@{utcnow('R')}",
+  "Content-Type": "application/xml"
 }
 
 
 
 
-
-
-{
-  "QueryConfig": {
-    "QueryType": "SQL",
-    "Expression": "SELECT Name, Brand, Price, Stock FROM BlobStorage WHERE Category = 'Electronics' AND Stock > 100"
-  },
-  "InputSerialization": {
-    "CsvSettings": {
-      "Header": "true",
-      "RecordSeparator": "\n",
-      "FieldSeparator": ","
-    }
-  },
-  "OutputSerialization": {
-    "CsvSettings": {
-      "Header": "true",
-      "RecordSeparator": "\n",
-      "FieldSeparator": ","
-    }
-  }
-}
+<?xml version="1.0" encoding="utf-8"?>
+<QueryRequest>
+  <QueryType>SQL</QueryType>
+  <Expression>SELECT Name, Brand, Price, Stock FROM BlobStorage WHERE Category = 'Electronics' AND Stock > 500 AND Availability = 'in_stock'</Expression>
+  <InputSerialization>
+    <Format>
+      <Type>CSV</Type>
+      <CsvSerializationSettings>
+        <HeadersPresent>true</HeadersPresent>
+        <RecordSeparator>\n</RecordSeparator>
+        <ColumnSeparator>,</ColumnSeparator>
+      </CsvSerializationSettings>
+    </Format>
+  </InputSerialization>
+  <OutputSerialization>
+    <Format>
+      <Type>CSV</Type>
+      <CsvSerializationSettings>
+        <HeadersPresent>true</HeadersPresent>
+        <RecordSeparator>\n</RecordSeparator>
+        <ColumnSeparator>,</ColumnSeparator>
+      </CsvSerializationSettings>
+    </Format>
+  </OutputSerialization>
+</QueryRequest>
