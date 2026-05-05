@@ -1,0 +1,8 @@
+{
+  "QueryConfig": {
+    "QueryType": "SQL",
+    "Expression": "SELECT Name, Brand, Price, Stock FROM BlobStorage WHERE Category = 'Electronics' AND Stock > 500 AND Availability = 'in_stock'"
+  },
+  "InputSerialization": { "CsvSettings": { "Header": "true" } },
+  "OutputSerialization": { "CsvSettings": { "Header": "true" } }
+}
