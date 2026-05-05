@@ -6,3 +6,29 @@
   "InputSerialization": { "CsvSettings": { "Header": "true" } },
   "OutputSerialization": { "CsvSettings": { "Header": "true" } }
 }
+
+
+
+
+
+
+{
+  "QueryConfig": {
+    "QueryType": "SQL",
+    "Expression": "SELECT Name, Brand, Price, Stock FROM BlobStorage WHERE Category = 'Electronics' AND Stock > 100"
+  },
+  "InputSerialization": {
+    "CsvSettings": {
+      "Header": "true",
+      "RecordSeparator": "\n",
+      "FieldSeparator": ","
+    }
+  },
+  "OutputSerialization": {
+    "CsvSettings": {
+      "Header": "true",
+      "RecordSeparator": "\n",
+      "FieldSeparator": ","
+    }
+  }
+}
