@@ -54,3 +54,14 @@ triggerBody()?['fileContent']?['$content']
 }
 
 
+
+{
+    "fileName": "@{pipeline().parameters.FileName}",
+    "emailTo": "saisakethreddy.lingala@usbank.com",
+    "fileContent": {
+        "$content": "@{base64(activity('GetFileContent').output.Response)}"
+    }
+}
+
+
+
