@@ -38,3 +38,19 @@ triggerBody()?['fileContent']?['$content']
 }
 
 
+
+{
+    "type": "object",
+    "properties": {
+        "fileName": { "type": "string" },
+        "emailTo": { "type": "string" },
+        "fileContent": {
+            "type": "object",
+            "properties": {
+                "$content": { "type": "string" }
+            }
+        }
+    }
+}
+
+
