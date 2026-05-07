@@ -40,18 +40,14 @@ triggerBody()?['fileContent']?['$content']
 
 
 {
-    "type": "object",
-    "properties": {
-        "fileName": { "type": "string" },
-        "emailTo": { "type": "string" },
-        "fileContent": {
-            "type": "object",
-            "properties": {
-                "$content": { "type": "string" }
-            }
-        }
+    "fileName": "@{pipeline().parameters.FileName}",
+    "emailTo": "saisakethreddy.lingala@usbank.com",
+    "fileContent": {
+        "$content": "@{activity('GetFileContent').output.Response}"
     }
 }
+
+
 
 
 
@@ -62,6 +58,5 @@ triggerBody()?['fileContent']?['$content']
         "$content": "@{base64(activity('GetFileContent').output.Response)}"
     }
 }
-
 
 
