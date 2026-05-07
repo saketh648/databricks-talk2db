@@ -1,11 +1,8 @@
-1. On Cost & Billing
-"Since Serverless All-Purpose compute doesn't support custom cluster tags, how will we attribute costs? Will the system.compute.usage table provide the granularity needed to see which of the 10 teams (via User Email or Service Principal) is consuming the DBUs?"
-
-2. On Security & Escape
-"How is the 'Shared' access mode enforced on serverless compute? Can you guarantee that a user in Team A cannot use a notebook to access the local disk or environment variables belonging to a session started by Team B?"
-
-3. On Workspace Configurations
-"Will you be setting Workspace-level Spark Conf limits? We need to ensure that the serverless compute is locked down so that no team can override the Unity Catalog security settings or storage credentials."
-
-4. On Networking
-"Does this serverless compute support Private Link or VNet connectivity back to our on-premise data sources? If Team A needs to reach a specific SQL Server on our network, will the serverless compute be able to route through our specific firewall rules?"
+{
+"fileName": "@{pipeline().parameters.FileName}",
+"emailTo": "your-email@domain.com",
+"fileContent": {
+"$content-type": "application/octet-stream",
+"$content": "@{base64(activity('GetFileContent').output)}"
+}
+}
