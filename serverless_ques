@@ -6,3 +6,16 @@
 "$content": "@{base64(activity('GetFileContent').output)}"
 }
 }
+
+
+
+
+
+{
+    "fileName": "test.csv",
+    "emailTo": "user@example.com",
+    "fileContent": {
+        "$content-type": "application/octet-stream",
+        "$content": "base64string"
+    }
+}
