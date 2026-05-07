@@ -19,3 +19,8 @@
         "$content": "base64string"
     }
 }
+
+
+
+triggerBody()?['fileContent']?['$content']
+
