@@ -24,3 +24,6 @@
 
 triggerBody()?['fileContent']?['$content']
 
+
+triggerBody()?['fileContent']?['$content']
+
