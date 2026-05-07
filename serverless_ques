@@ -27,3 +27,14 @@ triggerBody()?['fileContent']?['$content']
 
 triggerBody()?['fileContent']?['$content']
 
+
+
+{
+    "fileName": "@{pipeline().parameters.FileName}",
+    "emailTo": "your-email@u-s-bank.com",
+    "fileContent": {
+        "$content": "@{activity('GetFileContent').output.Response}"
+    }
+}
+
+
