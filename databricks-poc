@@ -1,0 +1,256 @@
+1. Identity, Access & Tenant Isolation
+
+(Focus: Authentication, RBAC, Secret Isolation)
+
+Entra ID Group Mapping
+
+* One-to-one mapping between Entra ID groups and Databricks teams/workspaces
+* Standardized naming convention for groups
+* SCIM-based automated group synchronization
+
+RBAC & Workspace Permissions
+
+* Role-based access model for:
+    * Admins
+    * Developers
+    * Analysts
+    * Service Principals
+* Least-privilege enforcement
+
+Secret & Credential Isolation
+
+* Dedicated Azure Key Vault-backed secret scopes per tenant/team
+* Prevent cross-team secret visibility
+* Restrict secret scope management to platform admins
+
+Service Principal Governance
+
+* Dedicated SPNs per application/team where required
+* PAT usage restrictions and lifecycle management
+* Managed Identity strategy clarification
+
+Open Questions
+
+* Will access provisioning be fully automated via IaC/SCIM?
+* Are platform admins centralized or delegated per team?
+* Will break-glass admin accounts exist?
+
+⸻
+
+2. Data Governance & Storage Architecture
+
+(Focus: Unity Catalog, Data Separation, Metadata Governance)
+
+Unity Catalog Strategy
+
+* Dedicated catalogs per tenant/team
+* Standardized schema hierarchy
+* Ownership boundaries clearly defined
+
+Example:
+
+* catalog = tenant/team
+* schema = domain/application
+* tables = datasets
+
+Storage Isolation
+
+* Separate ADLS Gen2 containers/storage accounts per tenant
+* External locations mapped through Unity Catalog
+* Managed vs external table strategy
+
+Data Access Controls
+
+* Table-level and column-level permissions
+* Row-level security requirements
+* PII/classification handling strategy
+
+Metadata & Lineage Governance
+
+* Enable lineage tracking
+* Data classification tags
+* Naming conventions for datasets and schemas
+
+Open Questions
+
+* Will storage separation be container-level or account-level?
+* Will tenants be allowed to create schemas dynamically?
+* Who owns catalog lifecycle management?
+
+⸻
+
+3. Compute Governance & Cost Management
+
+(Focus: Cluster Policies, Serverless, Chargeback)
+
+Cluster Policy Enforcement
+
+* Enforced cluster policies for:
+    * node types
+    * auto-scaling
+    * runtime versions
+    * idle termination
+    * tagging standards
+* Restrict unrestricted compute creation
+
+Serverless Compute Governance
+
+* Define approved workloads for serverless usage
+* Evaluate tenant isolation guarantees in shared serverless environments
+* Clarify supported access modes
+
+Cost Allocation & Chargeback
+
+* Mandatory tags:
+    * team_name
+    * cost_center
+    * environment
+    * application
+* Usage reporting via:
+    * system.billing
+    * system.compute
+    * Azure cost management
+
+Environment Strategy
+
+* Dev/Test/Prod separation model
+* Clarify:
+    * Single workspace with logical isolation
+    * Multiple workspaces per environment
+    * Catalog-level separation
+
+Open Questions
+
+* Can serverless usage be attributed cleanly per tenant?
+* Is serverless approved for production workloads?
+* What workloads require dedicated clusters?
+
+⸻
+
+4. CI/CD, Workflow & Development Lifecycle
+
+(Focus: Git Integration, Deployment Standards)
+
+Git Integration Strategy
+
+* Git provider integration standards
+* Dedicated repositories per team/domain
+* Service principal vs user PAT authentication model
+
+CI/CD Standards
+
+* Infrastructure as Code:
+    * Terraform
+    * Databricks Asset Bundles
+* Automated deployment pipelines
+* Promotion process across environments
+
+Workspace Folder Governance
+
+* Standardized workspace folder structure
+* ACL enforcement on:
+    * Repos
+    * Shared folders
+    * Workspace assets
+
+Job & Workflow Governance
+
+* Naming conventions for jobs/workflows
+* Job ownership standards
+* Retry/failure notification strategy
+
+Open Questions
+
+* Will deployments be centralized or team-managed?
+* Will notebooks be allowed directly in production?
+* What is the rollback strategy?
+
+⸻
+
+5. Collaboration, Sharing & Enterprise Governance
+
+(Focus: Sharing, Discovery, Compliance)
+
+Cross-Team Data Sharing
+
+* Zero-copy sharing using Unity Catalog grants
+* Approved sharing patterns between tenants
+* Controlled access request workflow
+
+Metadata Discovery
+
+* Catalog Explorer visibility strategy
+* Discoverability without automatic data access
+* Business glossary requirements
+
+Governance Tagging Standards
+
+Mandatory tags for:
+
+* team_name
+* cost_center
+* data_classification
+* environment
+* owner
+
+Auditing & Monitoring
+
+* Audit log retention strategy
+* Monitoring:
+    * access activity
+    * cluster creation
+    * failed jobs
+    * privilege escalations
+
+Compliance & Security
+
+* Data retention policies
+* Encryption standards
+* Regulatory requirements
+* Vulnerability scanning expectations
+
+Open Questions
+
+* Who approves cross-team data access?
+* What audit retention period is required?
+* Is centralized monitoring required in SIEM/Sentinel?
+
+⸻
+
+Additional Section I Highly Recommend Adding
+
+6. Operational Model & Platform Ownership
+
+This is usually missed but becomes critical later.
+
+Platform Ownership
+
+* Who owns:
+    * workspace administration
+    * Unity Catalog governance
+    * cluster policies
+    * onboarding/offboarding
+
+Tenant Onboarding Process
+
+Standard onboarding checklist:
+
+* Entra ID groups
+* Catalog creation
+* Storage mapping
+* Secret scopes
+* Cost center tagging
+* CI/CD setup
+
+Support Model
+
+* SLA expectations
+* Incident ownership
+* Escalation path
+
+Platform Guardrails
+
+* Approved runtimes
+* Approved libraries
+* Restricted external network access
+* Marketplace usage policy
