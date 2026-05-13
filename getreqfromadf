@@ -1,34 +1,10 @@
-{
-  "x-ms-version": "2020-04-08",
-  "x-ms-date": "@{utcnow('R')}",
-  "Content-Type": "application/xml"
-}
-
-
-
-
-<?xml version="1.0" encoding="utf-8"?>
-<QueryRequest>
-  <QueryType>SQL</QueryType>
-  <Expression>SELECT Name, Brand, Price, Stock FROM BlobStorage WHERE Category = 'Electronics' AND Stock > 500 AND Availability = 'in_stock'</Expression>
-  <InputSerialization>
-    <Format>
-      <Type>CSV</Type>
-      <CsvSerializationSettings>
-        <HeadersPresent>true</HeadersPresent>
-        <RecordSeparator>\n</RecordSeparator>
-        <ColumnSeparator>,</ColumnSeparator>
-      </CsvSerializationSettings>
-    </Format>
-  </InputSerialization>
-  <OutputSerialization>
-    <Format>
-      <Type>CSV</Type>
-      <CsvSerializationSettings>
-        <HeadersPresent>true</HeadersPresent>
-        <RecordSeparator>\n</RecordSeparator>
-        <ColumnSeparator>,</ColumnSeparator>
-      </CsvSerializationSettings>
-    </Format>
-  </OutputSerialization>
-</QueryRequest>
+<p style="font-family: Arial, sans-serif;">
+  <strong>Automated Data Delivery Notification</strong><br><br>
+  This is a system-generated email from the <strong>ADF-to-Email Integration Pipeline</strong>.<br><br>
+  <strong>File Name:</strong> @{triggerBody()?['fileName']}<br>
+  <strong>Source:</strong> ADLS Gen2 Landing Zone<br>
+  <strong>Timestamp:</strong> @{utcNow('f')}<br><br>
+  <em>The requested file is attached to this email. Please review the contents for accuracy.</em><br><br>
+  ---<br>
+  <strong>Security Note:</strong> This transmission was processed via secure Azure Global Backbone with Base64 integrity protection.
+</p>
