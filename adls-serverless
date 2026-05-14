@@ -1,0 +1,14 @@
+# Set the path to your CSV file
+adls_path = "abfss://<container>@<account>.dfs.core.windows.net/path/to/data.csv"
+
+# Create the table directly using SQL
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS my_lake_db.my_table 
+    USING CSV 
+    OPTIONS (
+        path "{adls_path}",
+        header "true",
+        inferSchema "true",
+        delimiter ","
+    )
+""")
