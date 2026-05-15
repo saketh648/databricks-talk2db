@@ -1,3 +1,14 @@
 SynapseBuiltinSqlPoolRequestsEnded
 | summarize by tostring(Properties.poolName)
 | project value = Properties_poolName, label = Properties_poolName
+
+
+
+
+SynapseBuiltinSqlPoolRequestsEnded
+| where TimeGenerated > ago(24h)
+| summarize 
+    TotalQueries = count(), 
+    LatestRun = max(TimeGenerated) 
+    by PoolName = tostring(Properties.poolName)
+| order by TotalQueries desc
