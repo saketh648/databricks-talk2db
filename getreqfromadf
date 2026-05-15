@@ -19,3 +19,11 @@ union isfuzzy=true
 | where isnotempty(EntityName)
 | summarize by EntityName
 | order by EntityName asc
+
+
+
+union isfuzzy=true
+(SynapseBuiltinSqlPoolRequestsEnded | summarize Count=count() by Table="Serverless"),
+(SynapseSqlPoolSqlRequests | summarize Count=count() by Table="Dedicated"),
+(SynapseSparkApplications | summarize Count=count() by Table="Spark")
+
