@@ -8,3 +8,21 @@
   ---<br>
   <strong>Security Note:</strong> This transmission was processed via secure Azure Global Backbone with Base64 integrity protection.
 </p>
+
+
+
+SynapseBuiltinSqlPoolRequestsEnded
+| where TimeGenerated > ago(30d)
+| extend DataProcessedBytes = tolong(Properties.dataProcessedBytes)
+// Convert Bytes to Terabytes (1024^4)
+| extend DataProcessedTB = todouble(DataProcessedBytes) / (1024.0 * 1024.0 * 1024.0 * 1024.0)
+// Calculate cost ($5 per TB)
+| extend EstimatedCostUSD = round(DataProcessedTB * 5.00, 4)
+| project 
+    TimeGenerated, 
+    Identity, 
+    EstimatedCostUSD, 
+    DataProcessedGB = round(DataProcessedTB * 1024, 2),
+    QueryText = tostring(Properties.queryText),
+    DurationMs = toint(Properties.durationMs)
+| order by EstimatedCostUSD desc
