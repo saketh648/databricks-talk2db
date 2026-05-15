@@ -1,29 +1,23 @@
 union isfuzzy=true 
 (
-    // 1. Get Serverless Database Names (dev_lake, dev_serverless, etc.)
+    // Get Serverless DBs (dev_lake, etc.)
     SynapseBuiltinSqlPoolRequestsEnded 
+    | where TimeGenerated > ago(7d)
     | extend EntityName = tostring(Properties.databaseName)
-    | project EntityName
+    | summarize by EntityName
 ),
 (
-    // 2. Get Dedicated SQL Pool Names
+    // Get Dedicated Pool Names - Using 'summarize' first to handle the 14M rows
     SynapseSqlPoolSqlRequests 
-    | extend EntityName = DatabaseName_s 
-    | project EntityName
+    | where TimeGenerated > ago(7d)
+    | summarize by EntityName = DatabaseName_s
 ),
 (
-    // 3. Get Spark Pool Names (Team Pools)
+    // Get Spark Pool Names
     SynapseSparkApplications 
-    | project EntityName = SparkPoolName
+    | where TimeGenerated > ago(7d)
+    | summarize by EntityName = SparkPoolName
 )
 | where isnotempty(EntityName)
 | summarize by EntityName
 | order by EntityName asc
-
-
-
-union isfuzzy=true
-(SynapseBuiltinSqlPoolRequestsEnded | summarize Count=count() by Table="Serverless"),
-(SynapseSqlPoolSqlRequests | summarize Count=count() by Table="Dedicated"),
-(SynapseSparkApplications | summarize Count=count() by Table="Spark")
-
