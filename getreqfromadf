@@ -12,3 +12,9 @@ SynapseBuiltinSqlPoolRequestsEnded
     LatestRun = max(TimeGenerated) 
     by PoolName = tostring(Properties.poolName)
 | order by TotalQueries desc
+
+
+SynapseBuiltinSqlPoolRequestsEnded
+| where TimeGenerated > ago(24h)
+| take 5
+| project Properties
