@@ -1,5 +1,7 @@
 union 
-(SynapseBuiltinSqlPoolRequestsEnded | project Name = tostring(Properties.databaseName)),
-(SynapseSqlPoolSqlRequests | project Name = ResourceGroupName_s) // Or specific pool column
-| summarize by Name
-| where isnotempty(Name)
+(SynapseBuiltinSqlPoolRequestsEnded | project EntityName = tostring(Properties.databaseName)),
+(SynapseSqlPoolSqlRequests | project EntityName = ResourceGroupName_s), // Captures Dedicated Pools
+(SynapseSparkApplications | project EntityName = SparkPoolName) // Captures Spark Teams
+| summarize by EntityName
+| where isnotempty(EntityName)
+| order by EntityName asc
