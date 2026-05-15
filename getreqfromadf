@@ -1,29 +1,18 @@
 SynapseBuiltinSqlPoolRequestsEnded
 | where TimeGenerated {TimeRange}
 | extend props = parse_json(tostring(Properties))
-| extend Cost = (todouble(props.dataProcessedBytes) / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
-// Explicitly cast Identity to string
-| extend UserIdentity = tostring(Identity) 
-| extend UserIdentity = iif(isempty(UserIdentity), "System/Automated", UserIdentity)
-| summarize Spend = sum(Cost) by UserIdentity
-| where Spend > 0
-| order by Spend desc
-
-
-
-SynapseBuiltinSqlPoolRequestsEnded
-| where TimeGenerated {TimeRange}
-| extend props = parse_json(tostring(Properties))
+// 1. Define all columns first
 | extend 
     Bytes = todouble(props.dataProcessedBytes),
+    User = tostring(Identity),
     SQL = tostring(props.queryText),
-    // Explicitly cast to string before converting to datetime
-    Start = todatetime(tostring(props.startTime)),
+    Start = toatetime(tostring(props.startTime)),
     End = todatetime(tostring(props.endTime))
+// 2. Now you can safely use those names in a 'where' or 'project'
+| where isnotempty(Bytes) and Bytes > 0
 | extend 
     DurationSec = datetime_diff('second', End, Start),
-    CostUSD = round((Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00, 4),
-    User = tostring(Identity)
+    CostUSD = round((Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00, 4)
 | project 
     TimeGenerated, 
     User = iif(isempty(User), "System", User), 
@@ -31,5 +20,4 @@ SynapseBuiltinSqlPoolRequestsEnded
     DataMB = round(Bytes / 1024 / 1024, 2),
     DurationSec,
     SQL
-| where Bytes > 0
 | order by TimeGenerated desc
