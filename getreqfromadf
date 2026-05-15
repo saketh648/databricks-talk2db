@@ -26,3 +26,64 @@ SynapseBuiltinSqlPoolRequestsEnded
     QueryText = tostring(Properties.queryText),
     DurationMs = toint(Properties.durationMs)
 | order by EstimatedCostUSD desc
+
+
+
+
+    SynapseBuiltinSqlPoolRequestsEnded
+    | where TimeGenerated {TimeRange}
+    | extend Pool = tostring(Properties.poolName)
+    | where Pool in ({PoolSelector}) or '{PoolSelector}' == '*'
+    | extend DataProcessedTB = todouble(Properties.dataProcessedBytes) / (1024.0 * 1024.0 * 1024.0 * 1024.0)
+    | summarize 
+        TotalCost = sum(DataProcessedTB * 5.00),
+        TotalDataGB = sum(DataProcessedTB * 1024)
+    | project 
+        ["Total Spend (USD)"] = strcat("$", round(TotalCost, 2)),
+        ["Data Scanned (GB)"] = round(TotalDataGB, 2)
+    ```
+3.  Set **Visualization** to `Tiles`. Click **Done Editing**.
+
+---
+
+### 4. Add the Breakdown Chart (Pool vs. Pool)
+1.  Click **Add** > **Add query**.
+2.  Paste this to see which of your 10 pools is the most expensive:
+    ```kusto
+    SynapseBuiltinSqlPoolRequestsEnded
+    | where TimeGenerated {TimeRange}
+    | extend Pool = tostring(Properties.poolName)
+    | where Pool in ({PoolSelector}) or '{PoolSelector}' == '*'
+    | extend Cost = (todouble(Properties.dataProcessedBytes) / 1.0995116e+12) * 5.00
+    | summarize CostByPool = sum(Cost) by Pool
+    ```
+3.  Set **Visualization** to `Bar chart`.
+
+---
+
+### 5. Add the "Top Expensive Queries" Table
+1.  Click **Add** > **Add query**.
+2.  Paste this for the granular audit:
+    
+```kusto
+    SynapseBuiltinSqlPoolRequestsEnded
+    | where TimeGenerated {TimeRange}
+    | extend Pool = tostring(Properties.poolName)
+    | where Pool in ({PoolSelector}) or '{PoolSelector}' == '*'
+    | extend DataProcessedGB = round(todouble(Properties.dataProcessedBytes) / (1024.0 * 1024.0 * 1024.0), 2)
+    | extend CostUSD = round((DataProcessedGB / 1024.0) * 5.00, 4)
+    | project TimeGenerated, User = Identity, Pool, CostUSD, DataProcessedGB, Query = tostring(Properties.queryText)
+    | order by CostUSD desc
+    | take 20
+    ```
+4.  Set **Visualization** to `Table`.
+
+---
+
+### 6. Save and Finalize
+1.  Click the **Save** icon in the top toolbar.
+2.  **Title:** `Synapse Serverless Cost Tracker`.
+3.  **Critical Step:** Click the **Pin** icon at the top of the workbook. Pin it to your **Azure Portal Dashboard**. 
+
+Now, every time you log into Azure, you won't have to hunt through Log Analytics. Your current spend across all 10 pools will be the first thing you see on your home screen.
+
