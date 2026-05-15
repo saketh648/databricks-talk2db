@@ -1,7 +1,21 @@
-union 
-(SynapseBuiltinSqlPoolRequestsEnded | project EntityName = tostring(Properties.databaseName)),
-(SynapseSqlPoolSqlRequests | project EntityName = ResourceGroupName_s), // Captures Dedicated Pools
-(SynapseSparkApplications | project EntityName = SparkPoolName) // Captures Spark Teams
-| summarize by EntityName
+union isfuzzy=true 
+(
+    // 1. Get Serverless Database Names (dev_lake, dev_serverless, etc.)
+    SynapseBuiltinSqlPoolRequestsEnded 
+    | extend EntityName = tostring(Properties.databaseName)
+    | project EntityName
+),
+(
+    // 2. Get Dedicated SQL Pool Names
+    SynapseSqlPoolSqlRequests 
+    | extend EntityName = DatabaseName_s 
+    | project EntityName
+),
+(
+    // 3. Get Spark Pool Names (Team Pools)
+    SynapseSparkApplications 
+    | project EntityName = SparkPoolName
+)
 | where isnotempty(EntityName)
+| summarize by EntityName
 | order by EntityName asc
