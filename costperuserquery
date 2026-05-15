@@ -1,0 +1,15 @@
+SynapseSqlPoolSqlRequests
+| where ResourceClass_s != ""
+| extend DurationHours = round(todouble(DurationMs_d) / 3600000, 4)
+// Define your Hourly Rate here (e.g., $15.10 for DW1000c)
+| extend PoolHourlyRate = 15.10 
+// Approximate slot percentage (Small=0.03, Med=0.12, Large=0.25, XL=0.5)
+| extend SlotWeight = case(
+    ResourceClass_s == "smallrc", 0.03,
+    ResourceClass_s == "mediumrc", 0.12,
+    ResourceClass_s == "largerc", 0.25,
+    ResourceClass_s == "xlargerc", 0.50, 
+    0.03)
+| extend EstimatedCost = round(DurationHours * PoolHourlyRate * SlotWeight, 4)
+| project TimeGenerated, LoginName_s, EstimatedCost, Command_s
+| order by EstimatedCost desc
