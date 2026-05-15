@@ -7,3 +7,12 @@ SynapseBuiltinSqlPoolRequestsEnded
 | summarize 
     ["Total Spend (USD)"] = strcat("$", round(sum(Cost), 2)),
     ["Data Scanned (GB)"] = round(sum(Bytes / (1024.0 * 1024.0 * 1024.0)), 2)
+
+
+SynapseBuiltinSqlPoolRequestsEnded
+| where TimeGenerated {TimeRange}
+| extend props = parse_json(tostring(Properties))
+| extend Cost = (todouble(props.dataProcessedBytes) / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
+| summarize Spend = sum(Cost) by Identity
+| order by Spend desc
+
