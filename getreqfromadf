@@ -16,3 +16,22 @@ SynapseBuiltinSqlPoolRequestsEnded
 | summarize Spend = sum(Cost) by Identity
 | order by Spend desc
 
+
+
+SynapseBuiltinSqlPoolRequestsEnded
+| where TimeGenerated {TimeRange}
+| extend props = parse_json(tostring(Properties))
+| extend 
+    Bytes = todouble(props.dataProcessedBytes),
+    SQL = tostring(props.queryText),
+    DurationSec = datetime_diff('second', datetime(props.endTime), datetime(props.startTime))
+| extend CostUSD = (Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
+| project 
+    TimeGenerated, 
+    Identity, 
+    CostUSD = round(CostUSD, 4), 
+    DataMB = round(Bytes / 1024 / 1024, 2),
+    DurationSec,
+    SQL
+| order by CostUSD desc
+
