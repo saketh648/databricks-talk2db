@@ -6,15 +6,15 @@ SynapseBuiltinSqlPoolRequestsEnded
     User = tostring(Identity),
     SQL = tostring(props.queryText)
 | where isnotempty(Bytes)
-// Calculate precision cost and MB
 | extend 
     DataMB = Bytes / (1024.0 * 1024.0),
-    CostUSD = (Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
+    // Calculating the $5/TB rate
+    RawCost = (Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
 | project 
     TimeGenerated, 
     User = iif(isempty(User), "System", User), 
-    // Increased to 6 decimals to catch small scans
-    CostUSD = format_number(CostUSD, 6), 
+    // Rounding to 6 decimal places to see the tiny costs
+    CostUSD = round(RawCost, 6), 
     DataMB = round(DataMB, 2),
     SQL
 | order by TimeGenerated desc
