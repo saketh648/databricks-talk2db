@@ -1,23 +1,20 @@
 SynapseBuiltinSqlPoolRequestsEnded
 | where TimeGenerated {TimeRange}
 | extend props = parse_json(tostring(Properties))
-// 1. Define all columns first
 | extend 
     Bytes = todouble(props.dataProcessedBytes),
     User = tostring(Identity),
-    SQL = tostring(props.queryText),
-    Start = toatetime(tostring(props.startTime)),
-    End = todatetime(tostring(props.endTime))
-// 2. Now you can safely use those names in a 'where' or 'project'
-| where isnotempty(Bytes) and Bytes > 0
+    SQL = tostring(props.queryText)
+| where isnotempty(Bytes)
+// Calculate precision cost and MB
 | extend 
-    DurationSec = datetime_diff('second', End, Start),
-    CostUSD = round((Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00, 4)
+    DataMB = Bytes / (1024.0 * 1024.0),
+    CostUSD = (Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
 | project 
     TimeGenerated, 
     User = iif(isempty(User), "System", User), 
-    CostUSD, 
-    DataMB = round(Bytes / 1024 / 1024, 2),
-    DurationSec,
+    // Increased to 6 decimals to catch small scans
+    CostUSD = format_number(CostUSD, 6), 
+    DataMB = round(DataMB, 2),
     SQL
 | order by TimeGenerated desc
