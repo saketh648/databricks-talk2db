@@ -1,7 +1,10 @@
 SynapseBuiltinSqlPoolRequestsEnded
-| where TimeGenerated > ago(30d)
+| where TimeGenerated {TimeRange}
 | extend props = parse_json(tostring(Properties))
-// If databaseName isn't there, we'll use 'Builtin' as a fallback
-| extend DB = coalesce(tostring(props.databaseName), "Built-in Pool")
-| summarize by DB
-| project value = DB, label = DB
+| extend Bytes = todouble(props.dataProcessedBytes)
+// Convert Bytes to Terabytes and apply the flat $5/TB rate
+| extend Cost = (Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
+| summarize 
+    ["Total Spend (USD)"] = strcat("$", round(sum(Cost), 2)),
+    ["Data Scanned (GB)"] = round(sum(Bytes / (1024.0 * 1024.0 * 1024.0)), 2),
+    ["Total Queries"] = count()
