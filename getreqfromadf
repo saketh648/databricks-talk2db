@@ -1,19 +1,12 @@
 SynapseBuiltinSqlPoolRequestsEnded
 | where TimeGenerated {TimeRange}
 | extend props = parse_json(tostring(Properties))
-| extend Bytes = todouble(props.dataProcessedBytes)
-// Convert Bytes to TB and multiply by $5.00
-| extend Cost = (Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
-| summarize 
-    ["Total Spend (USD)"] = strcat("$", round(sum(Cost), 2)),
-    ["Data Scanned (GB)"] = round(sum(Bytes / (1024.0 * 1024.0 * 1024.0)), 2)
-
-
-SynapseBuiltinSqlPoolRequestsEnded
-| where TimeGenerated {TimeRange}
-| extend props = parse_json(tostring(Properties))
 | extend Cost = (todouble(props.dataProcessedBytes) / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
-| summarize Spend = sum(Cost) by Identity
+// Explicitly cast Identity to string
+| extend UserIdentity = tostring(Identity) 
+| extend UserIdentity = iif(isempty(UserIdentity), "System/Automated", UserIdentity)
+| summarize Spend = sum(Cost) by UserIdentity
+| where Spend > 0
 | order by Spend desc
 
 
@@ -24,14 +17,19 @@ SynapseBuiltinSqlPoolRequestsEnded
 | extend 
     Bytes = todouble(props.dataProcessedBytes),
     SQL = tostring(props.queryText),
-    DurationSec = datetime_diff('second', datetime(props.endTime), datetime(props.startTime))
-| extend CostUSD = (Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
+    // Explicitly cast to string before converting to datetime
+    Start = todatetime(tostring(props.startTime)),
+    End = todatetime(tostring(props.endTime))
+| extend 
+    DurationSec = datetime_diff('second', End, Start),
+    CostUSD = round((Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00, 4),
+    User = tostring(Identity)
 | project 
     TimeGenerated, 
-    Identity, 
-    CostUSD = round(CostUSD, 4), 
+    User = iif(isempty(User), "System", User), 
+    CostUSD, 
     DataMB = round(Bytes / 1024 / 1024, 2),
     DurationSec,
     SQL
-| order by CostUSD desc
-
+| where Bytes > 0
+| order by TimeGenerated desc
