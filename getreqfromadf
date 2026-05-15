@@ -2,9 +2,8 @@ SynapseBuiltinSqlPoolRequestsEnded
 | where TimeGenerated {TimeRange}
 | extend props = parse_json(tostring(Properties))
 | extend Bytes = todouble(props.dataProcessedBytes)
-// Convert Bytes to Terabytes and apply the flat $5/TB rate
+// Convert Bytes to TB and multiply by $5.00
 | extend Cost = (Bytes / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.00
 | summarize 
     ["Total Spend (USD)"] = strcat("$", round(sum(Cost), 2)),
-    ["Data Scanned (GB)"] = round(sum(Bytes / (1024.0 * 1024.0 * 1024.0)), 2),
-    ["Total Queries"] = count()
+    ["Data Scanned (GB)"] = round(sum(Bytes / (1024.0 * 1024.0 * 1024.0)), 2)
