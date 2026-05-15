@@ -18,3 +18,17 @@ SynapseBuiltinSqlPoolRequestsEnded
 | where TimeGenerated > ago(24h)
 | take 5
 | project Properties
+
+
+SynapseBuiltinSqlPoolRequestsEnded
+| where TimeGenerated > ago(24h)
+| extend pName = coalesce(
+    tostring(Properties.poolName), 
+    tostring(Properties.PoolName), 
+    tostring(Properties.pool),
+    "Unknown Pool"
+)
+| summarize by pName
+| project value = pName, label = pName
+
+
