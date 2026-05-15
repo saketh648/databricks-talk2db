@@ -1,6 +1,9 @@
 SynapseBuiltinSqlPoolRequestsEnded
-| where TimeGenerated > ago(30d)
-| extend DB = tostring(Properties.databaseName)
-| where isnotempty(DB)
-| summarize by DB
-| project value = DB, label = DB
+| where TimeGenerated > ago(24h)
+| project 
+    TimeGenerated, 
+    Database = tostring(Properties.databaseName), 
+    DataMB = todouble(Properties.dataProcessedBytes) / 1024 / 1024,
+    User = Identity,
+    QueryText = tostring(Properties.queryText)
+| take 10
