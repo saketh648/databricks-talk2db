@@ -1,15 +1,45 @@
-SynapseBuiltinSqlPoolRequestsEnded
-| where TimeGenerated > ago(30d)
-| extend DataProcessedBytes = tolong(Properties.dataProcessedBytes)
-// Convert Bytes to Terabytes (1024^4)
-| extend DataProcessedTB = todouble(DataProcessedBytes) / (1024.0 * 1024.0 * 1024.0 * 1024.0)
-// Calculate cost ($5 per TB)
-| extend EstimatedCostUSD = round(DataProcessedTB * 5.00, 4)
+SynapseSparkJobExecutions
+| where TimeGenerated {TimeRange}
+// 1. Safe extraction of core fields (handling casing and potential dynamic types)
+| extend 
+    PoolName = tostring(SparkPoolName_s),
+    JobName = coalesce(tostring(JobName_s), tostring(LivvyId_s), "Interactive Notebook Session"),
+    User = tostring(Submitter_s),
+    DurationSec = todouble(DurationInSeconds_d),
+    JobType = tostring(JobType_s),
+    State = tostring(State_s)
+// 2. Filter out background heartbeats or unexecuted jobs
+| where isnotempty(DurationSec) and DurationSec > 0
+// 3. Dynamic SRU (Synapse Runtime Unit) allocation based on Node Sizing
+// This maps standard Node Tiers to their hourly SRU consumption factors
+| extend SRU_Per_Node_Hour = case(
+    PoolName contains "small", 1.0,   // Small Node (4 vCores) = 1 SRU/hr
+    PoolName contains "medium", 2.0,  // Medium Node (8 vCores) = 2 SRU/hr
+    PoolName contains "large", 4.0,   // Large Node (16 vCores) = 4 SRU/hr
+    PoolName contains "xlarge", 8.0,  // X-Large Node (32 vCores) = 8 SRU/hr
+    2.0                               // Default baseline fallback if tier is unlisted
+)
+// 4. Node Allocation Logic
+// Spark jobs scale dynamically. If your workspace logs the actual node count column, 
+// use it via 'coalesce', otherwise fall back to a standard baseline pipeline footprint (e.g., 3 nodes).
+| extend ActiveNodes = coalesce(todouble(vCores_d / 4.0), 3.0) 
+// 5. Financial Multiplier Math
+// Formula: (Seconds / 3600) * Node Count * Node SRU Factor * Base Hourly Rate ($0.132)
+| extend ComputeHours = DurationSec / 3600.0
+| extend EstimatedCostUSD = ComputeHours * ActiveNodes * SRU_Per_Node_Hour * 0.132
+// 6. Present the polished, workbook-scannable interface
 | project 
-    TimeGenerated, 
-    Identity, 
-    EstimatedCostUSD, 
-    DataProcessedGB = round(DataProcessedTB * 1024, 2),
-    QueryText = tostring(Properties.queryText),
-    DurationMs = toint(Properties.durationMs)
+    TimeGenerated,
+    NotebookOrJob = JobName,
+    User = iif(isempty(User), "Automated Pipeline", User),
+    PoolName,
+    JobType,
+    DurationMinutes = round(DurationSec / 60.0, 2),
+    CostUSD = round(EstimatedCostUSD, 4),
+    ExecutionStatus = case(
+        State =~ "Completed", "Success ✅",
+        State =~ "Failed", "Failed ❌",
+        State =~ "Cancelled", "Cancelled ⚠️",
+        State
+    )
 | order by EstimatedCostUSD desc
