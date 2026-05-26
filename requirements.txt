@@ -1,5 +1,2 @@
 streamlit
-databricks-connect>=15.4.0
-databricks-vectorsearch
 databricks-sdk
-pandas
