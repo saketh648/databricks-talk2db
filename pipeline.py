@@ -1,8 +1,12 @@
-# Cell 1 - paste entire pipeline.py contents here
+PIPELINE_CODE = """
 import pandas as pd
 import pyspark.sql.functions as F
 from pyspark.sql.types import *
 from databricks.vector_search.client import VectorSearchClient
+import json
+
+# Config injected by app
+cfg = CFG_PLACEHOLDER
 
 def normalize(df, name_col, id_col, cfg):
     return (
@@ -10,14 +14,22 @@ def normalize(df, name_col, id_col, cfg):
         .withColumn("src_company_name_raw", F.col(name_col))
         .withColumn("_upper", F.upper(F.col(name_col)))
         .withColumn("_stripped",
-            F.trim(F.regexp_replace(F.col("_upper"), cfg["strip_prefix_pattern"], ""))
+            F.trim(F.regexp_replace(
+                F.col("_upper"), cfg["strip_prefix_pattern"], ""
+            ))
         )
         .withColumn("_denoised",
-            F.trim(F.regexp_replace(F.col("_stripped"), cfg["strip_suffix_pattern"], ""))
+            F.trim(F.regexp_replace(
+                F.col("_stripped"), cfg["strip_suffix_pattern"], ""
+            ))
         )
-        .withColumn("name_clean", F.initcap(F.trim(F.col("_denoised"))))
+        .withColumn("name_clean",
+            F.initcap(F.trim(F.col("_denoised")))
+        )
         .withColumn("name_keyword",
-            F.initcap(F.trim(F.regexp_extract(F.col("_denoised"), r"^(\S+)", 1)))
+            F.initcap(F.trim(
+                F.regexp_extract(F.col("_denoised"), r"^(\S+)", 1)
+            ))
         )
         .drop("_upper", "_stripped", "_denoised")
         .withColumnRenamed(id_col, "sor_id")
@@ -102,7 +114,7 @@ def make_vector_worker(cfg):
                         "raw_vector_score":   top["score"] if top else 0.0,
                         "top_candidate_name": top["name"]  if top else "",
                     })
-                except Exception:
+                except Exception as ex:
                     results.append({
                         "name_clean":         name_clean,
                         "name_keyword":       name_keyword,
@@ -116,24 +128,21 @@ def make_vector_worker(cfg):
 def build_prompt_column():
     return F.concat_ws("",
         F.lit(
-            "You are an entity resolution assistant.\n"
+            "You are an entity resolution assistant.\\n"
             "Your job: given a raw company name string from a financial transaction, "
-            "find the best matching legal entity from the provided candidates.\n\n"
+            "find the best matching legal entity from the provided candidates.\\n\\n"
         ),
         F.lit("RAW INPUT: "),    F.col("name_clean"),
-        F.lit("\nCANDIDATES: "), F.col("candidates_json"),
+        F.lit("\\nCANDIDATES: "), F.col("candidates_json"),
         F.lit(
-            "\n\nINSTRUCTIONS:\n"
+            "\\n\\nINSTRUCTIONS:\\n"
             "1. The raw input may contain leading codes, product names, or abbreviations "
-            "that are NOT the company name — use judgment to identify the core brand.\n"
-            "2. From the candidates list, pick the one that best represents the "
-            "actual legal entity behind the raw input.\n"
-            "3. A candidate with a higher score is more likely to be correct, "
-            "but use the name similarity as your primary signal.\n"
-            "4. If none of the candidates plausibly match the core brand in the input, "
-            "output UNMATCHED.\n"
-            "5. Never output a numeric value or score as the match.\n\n"
-            "RESPOND IN THIS FORMAT ONLY (no extra text):\n"
+            "that are NOT the company name.\\n"
+            "2. Pick the candidate that best represents the actual legal entity.\\n"
+            "3. Higher score = more likely correct, but name similarity is primary signal.\\n"
+            "4. If none match, output UNMATCHED.\\n"
+            "5. Never output a numeric value or score.\\n\\n"
+            "RESPOND IN THIS FORMAT ONLY:\\n"
             "[MATCH]: <legal entity name or UNMATCHED> | [REASON]: <one sentence>"
         )
     )
@@ -141,24 +150,22 @@ def build_prompt_column():
 def run_pipeline(cfg, spark, log_fn=None):
     if log_fn is None:
         log_fn = print
-
     spark.catalog.clearCache()
     written_tables = []
 
-    log_fn("Loading and normalising source tables...")
+    log_fn("Loading source tables...")
     source_dfs = []
     for src in cfg["sources"]:
         df = normalize(
             spark.table(src["table"]),
-            name_col=src["name_col"],
-            id_col=src["id_col"],
-            cfg=cfg,
+            src["name_col"],
+            src["id_col"],
+            cfg
         )
         df = df.withColumn("_output_table", F.lit(src["output_table"]))
         source_dfs.append(df)
     log_fn(f"Loaded {len(source_dfs)} source table(s)")
 
-    log_fn("Building unique name registry...")
     if len(source_dfs) == 1:
         search_registry = source_dfs[0].select("name_clean", "name_keyword")
     else:
@@ -167,14 +174,13 @@ def run_pipeline(cfg, spark, log_fn=None):
             search_registry = search_registry.union(
                 d.select("name_clean", "name_keyword")
             )
+
     search_registry = search_registry.distinct().filter(
         F.col("name_clean").isNotNull() &
         (F.length(F.trim(F.col("name_clean"))) >= cfg["min_name_length"])
     )
-    unique_count = search_registry.count()
-    log_fn(f"{unique_count} unique names to resolve")
+    log_fn(f"{search_registry.count()} unique names to resolve")
 
-    log_fn("Running vector search...")
     vector_worker    = make_vector_worker(cfg)
     registry_matches = (
         search_registry
@@ -182,70 +188,65 @@ def run_pipeline(cfg, spark, log_fn=None):
         .mapInPandas(vector_worker, schema=result_schema)
         .cache()
     )
-    resolved_count = registry_matches.count()
-    log_fn(f"Vector search complete — {resolved_count} entities resolved")
+    log_fn(f"Vector search complete — {registry_matches.count()} resolved")
 
-    log_fn("Running LLM reasoning via ai_query...")
+    llm_model       = cfg["llm_model"]
+    llm_max_tokens  = cfg["llm_max_tokens"]
+    llm_temperature = cfg["llm_temperature"]
+
     answer_key = (
         registry_matches
         .withColumn("prompt", build_prompt_column())
         .repartition(cfg["llm_partitions"])
-        .withColumn(
-            "llm_raw",
-            F.expr(
-                f"ai_query("
-                f"  '{cfg['llm_model']}',"
-                f"  prompt,"
-                f"  map('max_tokens', '{cfg['llm_max_tokens']}', "
-                f"      'temperature', '{cfg['llm_temperature']}')"
-                f")"
-            )
-        )
+        .withColumn("llm_raw", F.expr(
+            f"ai_query('{llm_model}', prompt, "
+            f"map('max_tokens', '{llm_max_tokens}', "
+            f"    'temperature', '{llm_temperature}')"
+            f")"
+        ))
         .cache()
     )
     answer_key.count()
     log_fn("LLM reasoning complete")
 
     for src, df_clean in zip(cfg["sources"], source_dfs):
-        log_fn(f"Writing results for {src['table']}...")
         df_final = (
             df_clean
             .join(registry_matches, on="name_clean", how="left")
-            .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
-        )
-        df_final = (
-            df_final
+            .join(
+                answer_key.select("name_clean", "llm_raw"),
+                on="name_clean", how="left"
+            )
             .withColumn("matched_name_extracted",
                 F.trim(F.regexp_replace(
-                    F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1),
-                    r"[\*\[\]\"']", ""
+                    F.regexp_extract("llm_raw", r"\\[MATCH\\]:\\s*([^|]+)", 1),
+                    r"[\\*\\[\\]\\"\\']", ""
                 ))
             )
             .withColumn("match_explanation",
-                F.trim(F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1))
+                F.trim(F.regexp_extract(
+                    "llm_raw", r"\\[REASON\\]:\\s*(.*)", 1
+                ))
+            )
+            .withColumn("childcompanyname",
+                F.when(
+                    F.col("matched_name_extracted").isNotNull()
+                    & (F.length(F.trim(F.col("matched_name_extracted"))) >= cfg["min_name_length"])
+                    & (F.upper(F.trim(F.col("matched_name_extracted"))) != "UNMATCHED"),
+                    F.col("matched_name_extracted")
+                ).when(
+                    (F.col("raw_vector_score") >= cfg["score_fallback_min"])
+                    & F.col("top_candidate_name").isNotNull()
+                    & (F.length(F.trim(F.col("top_candidate_name"))) >= cfg["min_name_length"])
+                    & (~F.col("top_candidate_name").rlike(r"^[\\d\\.\\-]+$")),
+                    F.col("top_candidate_name")
+                ).otherwise(F.lit("No Clear Match"))
             )
         )
-        df_final = df_final.withColumn(
-            "childcompanyname",
-            F.when(
-                F.col("matched_name_extracted").isNotNull()
-                & (F.length(F.trim(F.col("matched_name_extracted"))) >= cfg["min_name_length"])
-                & (F.upper(F.trim(F.col("matched_name_extracted"))) != "UNMATCHED"),
-                F.col("matched_name_extracted")
-            )
-            .when(
-                (F.col("raw_vector_score") >= cfg["score_fallback_min"])
-                & F.col("top_candidate_name").isNotNull()
-                & (F.length(F.trim(F.col("top_candidate_name"))) >= cfg["min_name_length"])
-                & (~F.col("top_candidate_name").rlike(r"^[\d\.\-]+$")),
-                F.col("top_candidate_name")
-            )
-            .otherwise(F.lit("No Clear Match"))
-        )
-        out_table  = f"{cfg['output_database']}.{src['output_table']}"
-        final_cols = ["sor_id", "src_company_name_raw", "childcompanyname", "match_explanation"]
+        out_table = f"{cfg['output_database']}.{src['output_table']}"
         (
-            df_final.select(final_cols)
+            df_final
+            .select(["sor_id", "src_company_name_raw", "childcompanyname", "match_explanation"])
             .write.format("delta")
             .mode("overwrite")
             .option("overwriteSchema", "true")
@@ -254,21 +255,9 @@ def run_pipeline(cfg, spark, log_fn=None):
         written_tables.append(out_table)
         log_fn(f"Written to {out_table}")
 
-    log_fn(f"Pipeline complete. {len(written_tables)} table(s) written.")
+    log_fn(f"Done. {len(written_tables)} table(s) written.")
     return written_tables
 
-
-# ── Cell 2 - Run the pipeline ──────────────────────────────
-import json
-
-dbutils.widgets.text("config_json", "{}")
-config_json = dbutils.widgets.get("config_json")
-cfg = json.loads(config_json)
-
-print("Config received:")
-print(json.dumps(cfg, indent=2))
-print("Starting pipeline...")
-
-run_pipeline(cfg, spark, log_fn=print)
-
-print("Pipeline complete!")
+results = run_pipeline(cfg, spark, log_fn=print)
+print("DONE:", results)
+"""
