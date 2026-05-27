@@ -7,3 +7,63 @@ config_json = dbutils.widgets.get("config_json")
 
 # Execute the script inline within the cluster's native Spark context
 exec(script_code)
+
+
+
+
+if st.button("▶️ Initiate Entity Matching Job Loop", disabled=run_disabled, type="primary"):
+    log_box = st.empty()
+    logs = ["Initialising serverless pipeline execution context..."]
+    log_box.code(logs[0])
+
+    with st.spinner("Compiling UI configurations and dispatching cluster task thread..."):
+        try:
+            logs.append("Packaging string payloads into Notebook context channels...")
+            log_box.code("\n".join(logs))
+            
+            # 1. Modify your pipeline code block to parse the config parameter natively
+            # This replaces the sys.argv snippet we added in the previous step
+            injected_pipeline_script = "cfg = json.loads(dbutils.widgets.get('config_json'))\\n" + PIPELINE_CODE
+
+            from databricks.sdk.service.jobs import Task, NotebookTask
+
+            # 2. Submit via NotebookTask to allow massive data-payload limits
+            run_poller = w.jobs.submit(
+                run_name="entity_resolution_ui_invocation",
+                tasks=[
+                    Task(
+                        task_key="er_pipeline_exec",
+                        notebook_task=NotebookTask(
+                            notebook_path="/Shared/entity_resolution_runner",
+                            base_parameters={
+                                "script_code": injected_pipeline_script, # Passes your whole code block safely
+                                "config_json": json.dumps(config_preview) # Passes your live UI configurations
+                            }
+                        ),
+                        existing_cluster_id=CLUSTER_ID
+                    )
+                ]
+            ).result()
+            
+            st.success("🎉 Resolution loop complete! Clean targets compiled successfully inside target catalogs.")
+            st.balloons()
+            
+        except Exception as e:
+            st.error(f"Execution thread halted: {str(e)}")
+
+
+
+# Inside app.py, verify your PIPELINE_CODE string looks clean like this:
+PIPELINE_CODE = """
+import pandas as pd
+import pyspark.sql.functions as F
+from pyspark.sql.types import *
+from databricks.vector_search.client import VectorSearchClient
+import json
+
+# (Remove any 'cfg = ...' lines from the very top of the string, 
+# as our Notebook Task now injects that automatically!)
+
+def normalize(df, name_col, id_col, cfg):
+...
+"""
