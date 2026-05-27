@@ -1,20 +1,7 @@
-import json
-import sys
+import os
 
-# Point to your repo where pipeline.py lives
-sys.path.insert(0, "/Workspace/Repos/your-email/your-repo-name")
-
-from pipeline import run_pipeline
-
-# Widget to receive config from the app
-dbutils.widgets.text("config_json", "{}")
-config_json = dbutils.widgets.get("config_json")
-cfg = json.loads(config_json)
-
-print("Config received:")
-print(json.dumps(cfg, indent=2))
-print("Starting pipeline...")
-
-run_pipeline(cfg, spark, log_fn=print)
-
-print("Pipeline complete!")
+# Search for pipeline.py everywhere under your user folder
+for root, dirs, files in os.walk("/Workspace/Users"):
+    for file in files:
+        if "pipeline" in file.lower():
+            print(os.path.join(root, file))
