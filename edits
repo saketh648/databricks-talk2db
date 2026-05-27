@@ -1,0 +1,43 @@
+@st.cache_data(ttl=300)
+def list_catalogs():
+    try:
+        return [c.name for c in w.catalogs.list()]
+    except Exception as e:
+        st.error(f"Error listing catalogs: {e}")
+        return []
+
+@st.cache_data(ttl=300)
+def list_schemas(catalog):
+    try:
+        return [s.name for s in w.schemas.list(catalog_name=catalog)]
+    except Exception as e:
+        st.error(f"Error listing schemas: {e}")
+        return []
+
+@st.cache_data(ttl=300)
+def list_tables(catalog, schema):
+    try:
+        return [t.name for t in w.tables.list(catalog_name=catalog, schema_name=schema)]
+    except Exception as e:
+        st.error(f"Error listing tables: {e}")
+        return []
+
+@st.cache_data(ttl=60)
+def list_columns(catalog, schema, table):
+    try:
+        t = w.tables.get(full_name=f"{catalog}.{schema}.{table}")
+        if t and t.columns:
+            return [c.name for c in t.columns]
+        return []
+    except Exception as e:
+        st.error(f"Error listing columns: {e}")
+        return []
+
+
+
+
+try:
+    w = WorkspaceClient()
+except Exception as e:
+    st.error(f"Failed to connect to Databricks: {e}")
+    st.stop()
