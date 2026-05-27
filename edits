@@ -1,36 +1,43 @@
-if st.button("▶️ Initiate Entity Matching Job Loop", disabled=run_disabled, type="primary"):
-    log_box = st.empty()
-    logs = ["Initialising serverless pipeline execution context..."]
-    log_box.code(logs[0])
+import streamlit as st
+import pandas as pd
 
-    with st.spinner("Compiling UI configurations and dispatching cluster task thread..."):
+st.title("Simple Databricks Form App")
+
+# Form setup
+with st.form("user_form"):
+    name = st.text_input("Name")
+    email = st.text_input("Email")
+    environment = st.selectbox(
+        "Environment",
+        ["Dev", "QA", "Prod"]
+    )
+    submitted = st.form_submit_button("Submit")
+
+# Handle submit
+if submitted:
+    if name and email:
         try:
-            logs.append("Submitting dynamically compiled payload to target task runner...")
-            log_box.code("\n".join(logs))
+            data = [(name, email, environment)]
             
-            # Pack the JSON string directly into the command arguments array
-            config_json_str = json.dumps(config_preview)
-
-            # API Handoff using SparkSubmitTask flags to force zero-notebook background execution
-            run_poller = w.jobs.submit(
-                run_name="entity_resolution_ui_invocation",
-                tasks=[
-                    Task(
-                        task_key="er_pipeline_exec",
-                        spark_submit_task=SparkSubmitTask(
-                            parameters=[
-                                "-e", 
-                                PIPELINE_CODE,       # Argument 1: The raw unedited code string
-                                config_json_str      # Argument 2: Read inside the script via sys.argv[1]
-                            ]
-                        ),
-                        existing_cluster_id=CLUSTER_ID
-                    )
-                ]
-            ).result()
+            # 🚀 LAZY IMPORT: We import it here so the container doesn't crash on startup
+            from pyspark.sql import SparkSession
             
-            st.success("🎉 Resolution loop complete! Clean targets compiled successfully inside target catalogs.")
-            st.balloons()
+            # This automatically links to your active Single-User cluster session
+            spark = SparkSession.builder.getOrCreate()
+            
+            df = spark.createDataFrame(
+                data, 
+                ["name", "email", "environment"]
+            )
+            
+            # Save to your Delta table inside Unity Catalog
+            df.write.mode("append").saveAsTable("default.user_requests")
+            
+            st.success("🎉 Form submitted successfully!")
+            st.write("Submitted Data:")
+            st.dataframe(pd.DataFrame(data, columns=["name", "email", "environment"]))
             
         except Exception as e:
-            st.error(f"Execution thread halted: {str(e)}")
+            st.error(f"Cluster connection failed: {str(e)}")
+    else:
+        st.error("Please fill out all fields.")
