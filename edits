@@ -1,7 +1,10 @@
 import streamlit as st
-import os
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.sql import StatementState
+import pandas as pd
+from databricks import sql
+
+# ── 1. CLUSTER JDBC CONNECTION PROPERTIES (COPY FROM YOUR CLUSTER) ──────
+SERVER_HOSTNAME = "your-server-hostname.azuredatabricks.net"
+HTTP_PATH       = "sql/protocolv1/o/xxxxxx/xxxxxx"
 
 st.title("Simple Databricks Form App")
 
@@ -13,46 +16,38 @@ with st.form("user_form"):
 
 if submitted:
     if name and email:
-        try:
-            # 🚀 Fix 1: Initialize the WorkspaceClient using ambient container routing
-            # This stops the SDK from looking for missing secrets.toml configurations.
-            w = WorkspaceClient()
-
-            # 🚀 Fix 2: Hardcode your Warehouse ID directly to avoid missing environment variables
-            # (Replace this string with your actual warehouse ID from Connection Details)
-            warehouse_id = "your-actual-sql-warehouse-id" 
-
-            # Escape single quotes to avoid SQL injection
-            safe_name = name.replace("'", "''")
-            safe_email = email.replace("'", "''")
-            safe_env = environment.replace("'", "''")
-
-            statement = f"""
+        with st.spinner("Streaming record straight to single-user cluster..."):
+            try:
+                # ── 2. OPEN SECURE DIRECT CONNECTION ──
+                # Databricks Apps automatically provides your user's active login token 
+                # natively via the OAuth handshake, bypassing the Warehouse blocks!
+                connection = sql.connect(
+                    server_hostname=SERVER_HOSTNAME,
+                    http_path=HTTP_PATH,
+                    auth_type="databricks-oauth" 
+                )
+                
+                cursor = connection.cursor()
+                
+                # Sanitize inputs safely to prevent SQL issues
+                safe_name = name.replace("'", "''")
+                safe_email = email.replace("'", "''")
+                safe_env = environment.replace("'", "''")
+                
+                insert_query = f"""
                 INSERT INTO default.user_requests (name, email, environment)
                 VALUES ('{safe_name}', '{safe_email}', '{safe_env}')
-            """
-
-            with st.spinner("Executing statement via secure cloud control plane..."):
-                response = w.statement_execution.execute_statement(
-                    warehouse_id=warehouse_id,
-                    statement=statement,
-                )
-
-                # Poll statement status until completed or failed
-                result = w.statement_execution.get_statement(response.statement_id)
-                while result.status.state in (StatementState.PENDING, StatementState.RUNNING):
-                    import time
-                    time.sleep(1)
-                    result = w.statement_execution.get_statement(response.statement_id)
-
-                if result.status.state == StatementState.SUCCEEDED:
-                    st.success("🎉 Form submitted successfully!")
-                    st.write(f"**Name:** {name}  \n**Email:** {email}  \n**Environment:** {environment}")
-                    st.balloons()
-                else:
-                    st.error(f"Query failed: {result.status.error.message}")
-
-        except Exception as e:
-            st.error(f"Runtime Exception: {e}")
+                """
+                
+                cursor.execute(insert_query)
+                cursor.close()
+                connection.close()
+                
+                st.success("🎉 Form submitted successfully!")
+                st.write(f"**Name:** {name}  \n**Email:** {email}  \n**Environment:** {environment}")
+                st.balloons()
+                
+            except Exception as e:
+                st.error(f"Execution halted: {str(e)}")
     else:
-        st.error("Please fill in all fields.")
+        st.error("Please fill out all fields.")
