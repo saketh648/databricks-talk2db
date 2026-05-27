@@ -14,12 +14,13 @@ with st.form("user_form"):
 if submitted:
     if name and email:
         try:
+            # 🚀 Fix 1: Initialize the WorkspaceClient using ambient container routing
+            # This stops the SDK from looking for missing secrets.toml configurations.
             w = WorkspaceClient()
 
-            warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID")
-            if not warehouse_id:
-                st.error("DATABRICKS_WAREHOUSE_ID environment variable not set.")
-                st.stop()
+            # 🚀 Fix 2: Hardcode your Warehouse ID directly to avoid missing environment variables
+            # (Replace this string with your actual warehouse ID from Connection Details)
+            warehouse_id = "your-actual-sql-warehouse-id" 
 
             # Escape single quotes to avoid SQL injection
             safe_name = name.replace("'", "''")
@@ -31,19 +32,27 @@ if submitted:
                 VALUES ('{safe_name}', '{safe_email}', '{safe_env}')
             """
 
-            response = w.statement_execution.execute_statement(
-                warehouse_id=warehouse_id,
-                statement=statement,
-            )
+            with st.spinner("Executing statement via secure cloud control plane..."):
+                response = w.statement_execution.execute_statement(
+                    warehouse_id=warehouse_id,
+                    statement=statement,
+                )
 
-            result = w.statement_execution.get_statement(response.statement_id)
-            if result.status.state == StatementState.SUCCEEDED:
-                st.success("Form submitted successfully!")
-                st.write(f"**Name:** {name}  \n**Email:** {email}  \n**Environment:** {environment}")
-            else:
-                st.error(f"Query failed: {result.status.error}")
+                # Poll statement status until completed or failed
+                result = w.statement_execution.get_statement(response.statement_id)
+                while result.status.state in (StatementState.PENDING, StatementState.RUNNING):
+                    import time
+                    time.sleep(1)
+                    result = w.statement_execution.get_statement(response.statement_id)
+
+                if result.status.state == StatementState.SUCCEEDED:
+                    st.success("🎉 Form submitted successfully!")
+                    st.write(f"**Name:** {name}  \n**Email:** {email}  \n**Environment:** {environment}")
+                    st.balloons()
+                else:
+                    st.error(f"Query failed: {result.status.error.message}")
 
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Runtime Exception: {e}")
     else:
         st.error("Please fill in all fields.")
