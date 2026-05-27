@@ -1,68 +1,20 @@
-from databricks.sdk.service import jobs
+import json
+import sys
 
-if st.button("▶️ Run Entity Resolution", disabled=run_disabled, type="primary"):
-    log_box = st.empty()
-    logs = []
+# Point to your repo where pipeline.py lives
+sys.path.insert(0, "/Workspace/Repos/your-email/your-repo-name")
 
-    def log(msg):
-        logs.append(msg)
-        log_box.code("\n".join(logs))
+from pipeline import run_pipeline
 
-    with st.spinner("Running pipeline..."):
-        try:
-            log("Submitting job to Databricks...")
+# Widget to receive config from the app
+dbutils.widgets.text("config_json", "{}")
+config_json = dbutils.widgets.get("config_json")
+cfg = json.loads(config_json)
 
-            run = w.jobs.submit(
-                run_name="entity_resolution_app_run",
-                tasks=[
-                    jobs.SubmitTask(
-                        task_key="er_pipeline",
-                        existing_cluster_id="<your_cluster_id>",
-                        notebook_task=jobs.NotebookTask(
-                            notebook_path="/Shared/entity_resolution_runner",
-                            base_parameters={
-                                "config_json": json.dumps(config_preview)
-                            }
-                        )
-                    )
-                ]
-            ).result()
+print("Config received:")
+print(json.dumps(cfg, indent=2))
+print("Starting pipeline...")
 
-            log("✅ Pipeline complete!")
+run_pipeline(cfg, spark, log_fn=print)
 
-            # ── Show result previews ──
-            st.subheader("📊 Results Preview")
-            for src in sources_config:
-                out = f"{output_database}.{src['output_table']}"
-                st.markdown(f"**{out}**")
-                try:
-                    result = w.statement_execution.execute_statement(
-                        warehouse_id="<your_sql_warehouse_id>",
-                        statement=f"SELECT * FROM {out} LIMIT 50",
-                    )
-                    while result.status.state in (
-                        StatementState.PENDING, StatementState.RUNNING
-                    ):
-                        time.sleep(1)
-                        result = w.statement_execution.get_statement(
-                            result.statement_id
-                        )
-
-                    cols = [c.name for c in result.manifest.schema.columns]
-                    rows = [list(r.values) for r in result.result.data_array or []]
-                    st.dataframe(
-                        pd.DataFrame(rows, columns=cols),
-                        use_container_width=True
-                    )
-                except Exception as e:
-                    st.warning(f"Could not preview {out}: {e}")
-
-        except Exception as e:
-            log(f"❌ Error: {e}")
-            st.exception(e)
-
-
-
-
-from databricks.sdk.service import jobs
-from databricks.sdk.service.sql import StatementState
+print("Pipeline complete!")
