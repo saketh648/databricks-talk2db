@@ -1,11 +1,36 @@
-# FIXED - extract values before the f-string
-llm_model       = cfg['llm_model']
-llm_max_tokens  = cfg['llm_max_tokens']
-llm_temperature = cfg['llm_temperature']
+if st.button("▶️ Initiate Entity Matching Job Loop", disabled=run_disabled, type="primary"):
+    log_box = st.empty()
+    logs = ["Initialising serverless pipeline execution context..."]
+    log_box.code(logs[0])
 
-.withColumn("llm_raw", F.expr(
-    f"ai_query('{llm_model}', prompt, "
-    f"map('max_tokens', '{llm_max_tokens}', "
-    f"    'temperature', '{llm_temperature}')"
-    f")"
-))
+    with st.spinner("Compiling UI configurations and dispatching cluster task thread..."):
+        try:
+            logs.append("Submitting dynamically compiled payload to target task runner...")
+            log_box.code("\n".join(logs))
+            
+            # Pack the JSON string directly into the command arguments array
+            config_json_str = json.dumps(config_preview)
+
+            # API Handoff using SparkSubmitTask flags to force zero-notebook background execution
+            run_poller = w.jobs.submit(
+                run_name="entity_resolution_ui_invocation",
+                tasks=[
+                    Task(
+                        task_key="er_pipeline_exec",
+                        spark_submit_task=SparkSubmitTask(
+                            parameters=[
+                                "-e", 
+                                PIPELINE_CODE,       # Argument 1: The raw unedited code string
+                                config_json_str      # Argument 2: Read inside the script via sys.argv[1]
+                            ]
+                        ),
+                        existing_cluster_id=CLUSTER_ID
+                    )
+                ]
+            ).result()
+            
+            st.success("🎉 Resolution loop complete! Clean targets compiled successfully inside target catalogs.")
+            st.balloons()
+            
+        except Exception as e:
+            st.error(f"Execution thread halted: {str(e)}")
