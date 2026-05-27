@@ -1,5 +1,58 @@
-CREATE TABLE IF NOT EXISTS dev.mma_entityresolution.user_requests (
-    name STRING,
-    email STRING,
-    environment STRING
-) USING DELTA;
+import streamlit as st
+import pandas as pd
+from databricks import sql
+
+# ── 1. CLUSTER CONNECTION PROPERTIES ────────────────────────────────────
+SERVER_HOSTNAME = "your-server-hostname.azuredatabricks.net"
+HTTP_PATH       = "sql/protocolv1/o/xxxxxx/xxxxxx"
+TARGET_TABLE    = "dev.mma_entityresolution.user_requests"
+
+st.set_page_config(page_title="Databricks Form Engine", layout="centered")
+st.title("🏦 Enterprise Operational Form Portal")
+
+# ── 2. USER INTERFACE FRONT-END GRID ────────────────────────────────────
+with st.form("user_form", clear_on_submit=True):
+    st.subheader("📝 Record Entry Form")
+    name = st.text_input("Full Name", placeholder="e.g. John Doe")
+    email = st.text_input("Corporate Email Address", placeholder="e.g. j.doe@company.com")
+    environment = st.selectbox("Deployment Environment Tier", ["Dev", "QA", "Prod"], index=0)
+    submitted = st.form_submit_button("🚀 Submit to Unity Catalog")
+
+# ── 3. DATA STREAM ROUTING WITH AUTO-COMMIT ─────────────────────────────
+if submitted:
+    if name and email:
+        with st.spinner("Streaming record through secure cluster proxy..."):
+            try:
+                connection = sql.connect(
+                    server_hostname=SERVER_HOSTNAME,
+                    http_path=HTTP_PATH,
+                    auth_type="databricks-oauth" 
+                )
+                
+                cursor = connection.cursor()
+                
+                safe_name = name.replace("'", "''")
+                safe_email = email.replace("'", "''")
+                safe_env = environment.replace("'", "''")
+                
+                insert_query = f"""
+                INSERT INTO {TARGET_TABLE} (name, email, environment)
+                VALUES ('{safe_name}', '{safe_email}', '{safe_env}')
+                """
+                
+                # Execute the write
+                cursor.execute(insert_query)
+                
+                # 🚀 THE CRITICAL FIX: Force the cluster to commit the transaction to disk
+                connection.commit() 
+                
+                cursor.close()
+                connection.close()
+                
+                st.success("🎉 Form data recorded and committed successfully in Unity Catalog!")
+                st.balloons()
+                
+            except Exception as e:
+                st.error(f"❌ Execution Halted: {str(e)}")
+    else:
+        st.error("⚠️ Submission blocked: Please ensure both Name and Email fields are fully populated.")
