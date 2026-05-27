@@ -1,43 +1,68 @@
-@st.cache_data(ttl=300)
-def list_catalogs():
-    try:
-        return [c.name for c in w.catalogs.list()]
-    except Exception as e:
-        st.error(f"Error listing catalogs: {e}")
-        return []
+from databricks.sdk.service import jobs
 
-@st.cache_data(ttl=300)
-def list_schemas(catalog):
-    try:
-        return [s.name for s in w.schemas.list(catalog_name=catalog)]
-    except Exception as e:
-        st.error(f"Error listing schemas: {e}")
-        return []
+if st.button("▶️ Run Entity Resolution", disabled=run_disabled, type="primary"):
+    log_box = st.empty()
+    logs = []
 
-@st.cache_data(ttl=300)
-def list_tables(catalog, schema):
-    try:
-        return [t.name for t in w.tables.list(catalog_name=catalog, schema_name=schema)]
-    except Exception as e:
-        st.error(f"Error listing tables: {e}")
-        return []
+    def log(msg):
+        logs.append(msg)
+        log_box.code("\n".join(logs))
 
-@st.cache_data(ttl=60)
-def list_columns(catalog, schema, table):
-    try:
-        t = w.tables.get(full_name=f"{catalog}.{schema}.{table}")
-        if t and t.columns:
-            return [c.name for c in t.columns]
-        return []
-    except Exception as e:
-        st.error(f"Error listing columns: {e}")
-        return []
+    with st.spinner("Running pipeline..."):
+        try:
+            log("Submitting job to Databricks...")
+
+            run = w.jobs.submit(
+                run_name="entity_resolution_app_run",
+                tasks=[
+                    jobs.SubmitTask(
+                        task_key="er_pipeline",
+                        existing_cluster_id="<your_cluster_id>",
+                        notebook_task=jobs.NotebookTask(
+                            notebook_path="/Shared/entity_resolution_runner",
+                            base_parameters={
+                                "config_json": json.dumps(config_preview)
+                            }
+                        )
+                    )
+                ]
+            ).result()
+
+            log("✅ Pipeline complete!")
+
+            # ── Show result previews ──
+            st.subheader("📊 Results Preview")
+            for src in sources_config:
+                out = f"{output_database}.{src['output_table']}"
+                st.markdown(f"**{out}**")
+                try:
+                    result = w.statement_execution.execute_statement(
+                        warehouse_id="<your_sql_warehouse_id>",
+                        statement=f"SELECT * FROM {out} LIMIT 50",
+                    )
+                    while result.status.state in (
+                        StatementState.PENDING, StatementState.RUNNING
+                    ):
+                        time.sleep(1)
+                        result = w.statement_execution.get_statement(
+                            result.statement_id
+                        )
+
+                    cols = [c.name for c in result.manifest.schema.columns]
+                    rows = [list(r.values) for r in result.result.data_array or []]
+                    st.dataframe(
+                        pd.DataFrame(rows, columns=cols),
+                        use_container_width=True
+                    )
+                except Exception as e:
+                    st.warning(f"Could not preview {out}: {e}")
+
+        except Exception as e:
+            log(f"❌ Error: {e}")
+            st.exception(e)
 
 
 
 
-try:
-    w = WorkspaceClient()
-except Exception as e:
-    st.error(f"Failed to connect to Databricks: {e}")
-    st.stop()
+from databricks.sdk.service import jobs
+from databricks.sdk.service.sql import StatementState
