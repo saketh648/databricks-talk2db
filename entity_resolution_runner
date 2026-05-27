@@ -1,11 +1,9 @@
-# Databricks notebook: entity_resolution_runner
-import json
+# Databricks notebook: /Shared/entity_resolution_runner
+import sys, json
 
+# Read the parameters sent dynamically by the Streamlit App UI
+script_code = dbutils.widgets.get("script_code")
 config_json = dbutils.widgets.get("config_json")
-cfg = json.loads(config_json)
 
-# Import pipeline from the app's repo (if using Databricks Repos)
-# or just paste the pipeline functions inline here
-exec(open("/path/to/pipeline.py").read())
-
-run_pipeline(cfg, spark)
+# Execute the script inline within the cluster's native Spark context
+exec(script_code)
