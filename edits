@@ -1,53 +1,7 @@
-import streamlit as st
-import pandas as pd
-from databricks import sql
+# 🚀 Update your table path from "default.user_requests" 
+# to your explicit workspace catalog and schema:
 
-# ── 1. CLUSTER JDBC CONNECTION PROPERTIES (COPY FROM YOUR CLUSTER) ──────
-SERVER_HOSTNAME = "your-server-hostname.azuredatabricks.net"
-HTTP_PATH       = "sql/protocolv1/o/xxxxxx/xxxxxx"
-
-st.title("Simple Databricks Form App")
-
-with st.form("user_form"):
-    name = st.text_input("Name")
-    email = st.text_input("Email")
-    environment = st.selectbox("Environment", ["Dev", "QA", "Prod"])
-    submitted = st.form_submit_button("Submit")
-
-if submitted:
-    if name and email:
-        with st.spinner("Streaming record straight to single-user cluster..."):
-            try:
-                # ── 2. OPEN SECURE DIRECT CONNECTION ──
-                # Databricks Apps automatically provides your user's active login token 
-                # natively via the OAuth handshake, bypassing the Warehouse blocks!
-                connection = sql.connect(
-                    server_hostname=SERVER_HOSTNAME,
-                    http_path=HTTP_PATH,
-                    auth_type="databricks-oauth" 
-                )
-                
-                cursor = connection.cursor()
-                
-                # Sanitize inputs safely to prevent SQL issues
-                safe_name = name.replace("'", "''")
-                safe_email = email.replace("'", "''")
-                safe_env = environment.replace("'", "''")
-                
-                insert_query = f"""
-                INSERT INTO default.user_requests (name, email, environment)
-                VALUES ('{safe_name}', '{safe_email}', '{safe_env}')
-                """
-                
-                cursor.execute(insert_query)
-                cursor.close()
-                connection.close()
-                
-                st.success("🎉 Form submitted successfully!")
-                st.write(f"**Name:** {name}  \n**Email:** {email}  \n**Environment:** {environment}")
-                st.balloons()
-                
-            except Exception as e:
-                st.error(f"Execution halted: {str(e)}")
-    else:
-        st.error("Please fill out all fields.")
+insert_query = f"""
+INSERT INTO dev.mma_entityresolution.user_requests (name, email, environment)
+VALUES ('{safe_name}', '{safe_email}', '{safe_env}')
+"""
