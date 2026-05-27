@@ -1,43 +1,43 @@
 import streamlit as st
-import pandas as pd
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.sql import StatementState
 
 st.title("Simple Databricks Form App")
 
-# Form setup
 with st.form("user_form"):
     name = st.text_input("Name")
     email = st.text_input("Email")
-    environment = st.selectbox(
-        "Environment",
-        ["Dev", "QA", "Prod"]
-    )
+    environment = st.selectbox("Environment", ["Dev", "QA", "Prod"])
     submitted = st.form_submit_button("Submit")
 
-# Handle submit
 if submitted:
     if name and email:
         try:
-            data = [(name, email, environment)]
-            
-            # 🚀 LAZY IMPORT: We import it here so the container doesn't crash on startup
-            from pyspark.sql import SparkSession
-            
-            # This automatically links to your active Single-User cluster session
-            spark = SparkSession.builder.getOrCreate()
-            
-            df = spark.createDataFrame(
-                data, 
-                ["name", "email", "environment"]
+            # SDK auto-reads credentials from the app's environment
+            w = WorkspaceClient()
+
+            # Use the SQL Statement Execution API instead of SparkSession
+            warehouse_id = st.secrets["warehouse_id"]  # set in app config
+
+            statement = f"""
+                INSERT INTO default.user_requests (name, email, environment)
+                VALUES ('{name}', '{email}', '{environment}')
+            """
+
+            response = w.statement_execution.execute_statement(
+                warehouse_id=warehouse_id,
+                statement=statement,
             )
-            
-            # Save to your Delta table inside Unity Catalog
-            df.write.mode("append").saveAsTable("default.user_requests")
-            
-            st.success("🎉 Form submitted successfully!")
-            st.write("Submitted Data:")
-            st.dataframe(pd.DataFrame(data, columns=["name", "email", "environment"]))
-            
+
+            # Poll until done
+            result = w.statement_execution.get_statement(response.statement_id)
+            if result.status.state == StatementState.SUCCEEDED:
+                st.success("Form submitted successfully!")
+                st.write(f"Name: {name}, Email: {email}, Environment: {environment}")
+            else:
+                st.error(f"Query failed: {result.status.error}")
+
         except Exception as e:
-            st.error(f"Cluster connection failed: {str(e)}")
+            st.error(f"Error: {e}")
     else:
-        st.error("Please fill out all fields.")
+        st.error("Please fill in all fields.")
