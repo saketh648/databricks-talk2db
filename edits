@@ -1,7 +1,284 @@
-import os
+from databricks.sdk.service.compute import Language
 
-# Search for pipeline.py everywhere under your user folder
-for root, dirs, files in os.walk("/Workspace/Users"):
-    for file in files:
-        if "pipeline" in file.lower():
-            print(os.path.join(root, file))
+if st.button("▶️ Run Entity Resolution", disabled=run_disabled, type="primary"):
+
+    log_box = st.empty()
+    logs = []
+
+    def log(msg):
+        logs.append(msg)
+        log_box.code("\n".join(logs))
+
+    with st.spinner("Pipeline running..."):
+        try:
+            log("Connecting to cluster...")
+
+            CLUSTER_ID = "your-cluster-id"  # ← your cluster id here
+
+            # Create execution context on the cluster
+            context = w.command_execution.create(
+                cluster_id=CLUSTER_ID,
+                language=Language.PYTHON
+            ).result()
+
+            log("✅ Connected to cluster")
+            log("⏳ Running pipeline...")
+
+            # Build the full pipeline code + config as one string
+            code = f"""
+import pandas as pd
+import pyspark.sql.functions as F
+from pyspark.sql.types import *
+from databricks.vector_search.client import VectorSearchClient
+import json
+
+cfg = {json.dumps(config_preview)}
+
+# ── paste normalize() here ──
+def normalize(df, name_col, id_col, cfg):
+    return (
+        df
+        .withColumn("src_company_name_raw", F.col(name_col))
+        .withColumn("_upper", F.upper(F.col(name_col)))
+        .withColumn("_stripped",
+            F.trim(F.regexp_replace(F.col("_upper"), cfg["strip_prefix_pattern"], ""))
+        )
+        .withColumn("_denoised",
+            F.trim(F.regexp_replace(F.col("_stripped"), cfg["strip_suffix_pattern"], ""))
+        )
+        .withColumn("name_clean", F.initcap(F.trim(F.col("_denoised"))))
+        .withColumn("name_keyword",
+            F.initcap(F.trim(F.regexp_extract(F.col("_denoised"), r"^(\\S+)", 1)))
+        )
+        .drop("_upper", "_stripped", "_denoised")
+        .withColumnRenamed(id_col, "sor_id")
+    )
+
+result_schema = StructType([
+    StructField("name_clean",         StringType(), True),
+    StructField("name_keyword",       StringType(), True),
+    StructField("candidates_json",    StringType(), True),
+    StructField("raw_vector_score",   FloatType(),  True),
+    StructField("top_candidate_name", StringType(), True),
+])
+
+def is_valid_name(name, max_digit_fraction):
+    if not name or len(name.strip()) < 2:
+        return False
+    digit_ratio = sum(c.isdigit() for c in name) / len(name)
+    return digit_ratio < max_digit_fraction
+
+def make_vector_worker(cfg):
+    endpoint       = cfg["vector_endpoint"]
+    index_name     = cfg["vector_index"]
+    name_col       = cfg["vector_name_col"]
+    top_k          = cfg["vector_top_k"]
+    boost_exact    = cfg["score_boost_exact"]
+    boost_partial  = cfg["score_boost_partial"]
+    boost_reverse  = cfg["score_boost_reverse"]
+    max_digit_frac = cfg["max_digit_fraction"]
+
+    def worker(iterator):
+        import json
+        vsc   = VectorSearchClient()
+        index = vsc.get_index(endpoint_name=endpoint, index_name=index_name)
+        for pdf in iterator:
+            results = []
+            for _, row in pdf.iterrows():
+                name_clean   = str(row["name_clean"])   if row["name_clean"]   else ""
+                name_keyword = str(row["name_keyword"]) if row["name_keyword"] else ""
+                try:
+                    r1 = index.similarity_search(
+                        query_text=name_clean,
+                        columns=[name_col],
+                        num_results=top_k
+                    ).get("result", {}).get("data_array", [])
+                    r2 = []
+                    if name_keyword and name_keyword.lower() != name_clean.lower():
+                        r2 = index.similarity_search(
+                            query_text=name_keyword,
+                            columns=[name_col],
+                            num_results=top_k
+                        ).get("result", {}).get("data_array", [])
+                    kw_upper   = name_keyword.upper()
+                    full_upper = name_clean.upper()
+                    seen = {{}}
+                    for data, weight in [(r1, 1.0), (r2, 0.95)]:
+                        for r in data:
+                            c_name  = str(r[0]).strip()
+                            v_score = float(r[-1])
+                            if not is_valid_name(c_name, max_digit_frac):
+                                continue
+                            c_upper = c_name.upper()
+                            if kw_upper and kw_upper in c_upper:
+                                boost = boost_exact
+                            elif full_upper and full_upper in c_upper:
+                                boost = boost_partial
+                            elif kw_upper and c_upper in kw_upper:
+                                boost = boost_reverse
+                            else:
+                                boost = 1.0
+                            final_score = round(v_score * 100 * boost * weight, 2)
+                            if c_name not in seen or final_score > seen[c_name]:
+                                seen[c_name] = final_score
+                    processed = sorted(
+                        [{{"name": n, "score": s}} for n, s in seen.items()],
+                        key=lambda x: x["score"], reverse=True
+                    )[:5]
+                    top = processed[0] if processed else None
+                    results.append({{
+                        "name_clean":         name_clean,
+                        "name_keyword":       name_keyword,
+                        "candidates_json":    json.dumps(processed),
+                        "raw_vector_score":   top["score"] if top else 0.0,
+                        "top_candidate_name": top["name"]  if top else "",
+                    }})
+                except Exception as ex:
+                    results.append({{
+                        "name_clean":         name_clean,
+                        "name_keyword":       name_keyword,
+                        "candidates_json":    "[]",
+                        "raw_vector_score":   0.0,
+                        "top_candidate_name": "",
+                    }})
+            yield pd.DataFrame(results)
+    return worker
+
+def build_prompt_column():
+    return F.concat_ws("",
+        F.lit(
+            "You are an entity resolution assistant.\\n"
+            "Your job: given a raw company name string from a financial transaction, "
+            "find the best matching legal entity from the provided candidates.\\n\\n"
+        ),
+        F.lit("RAW INPUT: "),    F.col("name_clean"),
+        F.lit("\\nCANDIDATES: "), F.col("candidates_json"),
+        F.lit(
+            "\\n\\nINSTRUCTIONS:\\n"
+            "1. The raw input may contain leading codes, product names, or abbreviations "
+            "that are NOT the company name.\\n"
+            "2. Pick the candidate that best represents the actual legal entity.\\n"
+            "3. Higher score = more likely correct, but use name similarity as primary signal.\\n"
+            "4. If none match, output UNMATCHED.\\n"
+            "5. Never output a numeric value or score.\\n\\n"
+            "RESPOND IN THIS FORMAT ONLY:\\n"
+            "[MATCH]: <legal entity name or UNMATCHED> | [REASON]: <one sentence>"
+        )
+    )
+
+def run_pipeline(cfg, spark, log_fn=None):
+    if log_fn is None:
+        log_fn = print
+    spark.catalog.clearCache()
+    written_tables = []
+    log_fn("Loading source tables...")
+    source_dfs = []
+    for src in cfg["sources"]:
+        df = normalize(spark.table(src["table"]), src["name_col"], src["id_col"], cfg)
+        df = df.withColumn("_output_table", F.lit(src["output_table"]))
+        source_dfs.append(df)
+    log_fn(f"Loaded {{len(source_dfs)}} source table(s)")
+    if len(source_dfs) == 1:
+        search_registry = source_dfs[0].select("name_clean", "name_keyword")
+    else:
+        search_registry = source_dfs[0].select("name_clean", "name_keyword")
+        for d in source_dfs[1:]:
+            search_registry = search_registry.union(d.select("name_clean", "name_keyword"))
+    search_registry = search_registry.distinct().filter(
+        F.col("name_clean").isNotNull() &
+        (F.length(F.trim(F.col("name_clean"))) >= cfg["min_name_length"])
+    )
+    log_fn(f"{{search_registry.count()}} unique names to resolve")
+    vector_worker    = make_vector_worker(cfg)
+    registry_matches = (
+        search_registry
+        .repartition(cfg["vector_partitions"])
+        .mapInPandas(vector_worker, schema=result_schema)
+        .cache()
+    )
+    log_fn(f"Vector search complete — {{registry_matches.count()}} resolved")
+    answer_key = (
+        registry_matches
+        .withColumn("prompt", build_prompt_column())
+        .repartition(cfg["llm_partitions"])
+        .withColumn("llm_raw", F.expr(
+            f"ai_query('{{cfg['llm_model']}}', prompt, "
+            f"map('max_tokens', '{{cfg['llm_max_tokens']}}', 'temperature', '{{cfg['llm_temperature']}}')"
+            f")"
+        ))
+        .cache()
+    )
+    answer_key.count()
+    log_fn("LLM reasoning complete")
+    for src, df_clean in zip(cfg["sources"], source_dfs):
+        df_final = (
+            df_clean
+            .join(registry_matches, on="name_clean", how="left")
+            .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
+            .withColumn("matched_name_extracted",
+                F.trim(F.regexp_replace(
+                    F.regexp_extract("llm_raw", r"\\[MATCH\\]:\\s*([^|]+)", 1),
+                    r"[\\*\\[\\]\\"\\']", ""
+                ))
+            )
+            .withColumn("match_explanation",
+                F.trim(F.regexp_extract("llm_raw", r"\\[REASON\\]:\\s*(.*)", 1))
+            )
+            .withColumn("childcompanyname",
+                F.when(
+                    F.col("matched_name_extracted").isNotNull()
+                    & (F.length(F.trim(F.col("matched_name_extracted"))) >= cfg["min_name_length"])
+                    & (F.upper(F.trim(F.col("matched_name_extracted"))) != "UNMATCHED"),
+                    F.col("matched_name_extracted")
+                ).when(
+                    (F.col("raw_vector_score") >= cfg["score_fallback_min"])
+                    & F.col("top_candidate_name").isNotNull()
+                    & (F.length(F.trim(F.col("top_candidate_name"))) >= cfg["min_name_length"])
+                    & (~F.col("top_candidate_name").rlike(r"^[\\d\\.\\-]+$")),
+                    F.col("top_candidate_name")
+                ).otherwise(F.lit("No Clear Match"))
+            )
+        )
+        out_table = f"{{cfg['output_database']}}.{{src['output_table']}}"
+        df_final.select(["sor_id", "src_company_name_raw", "childcompanyname", "match_explanation"]) \\
+            .write.format("delta").mode("overwrite") \\
+            .option("overwriteSchema", "true").saveAsTable(out_table)
+        written_tables.append(out_table)
+        log_fn(f"Written to {{out_table}}")
+    log_fn(f"Done. {{len(written_tables)}} table(s) written.")
+    return written_tables
+
+# Run it
+results = run_pipeline(cfg, spark, log_fn=print)
+print("TABLES_WRITTEN:", results)
+"""
+
+            # Execute on cluster
+            result = w.command_execution.execute(
+                cluster_id=CLUSTER_ID,
+                context_id=context.id,
+                language=Language.PYTHON,
+                command=code
+            ).result()
+
+            # Clean up context
+            w.command_execution.destroy(
+                cluster_id=CLUSTER_ID,
+                context_id=context.id
+            )
+
+            if result.results.result_type.value == "error":
+                log(f"❌ Pipeline failed: {result.results.cause}")
+            else:
+                log("✅ Pipeline complete!")
+                log(result.results.data or "")
+
+                st.success("✅ Done! Check your tables in Databricks Catalog.")
+                st.markdown("**Tables written:**")
+                for src in sources_config:
+                    out = f"{OUTPUT_DATABASE}.{src['output_table']}"
+                    st.code(out)
+
+        except Exception as e:
+            log(f"❌ Error: {e}")
+            st.exception(e)
