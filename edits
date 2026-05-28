@@ -1,61 +1,78 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome to My Static Site</title>
-    <style>
-        :root {
-            --primary: #2563eb;
-            --dark: #0f172a;
-            --light: #f8fafc;
-        }
-        body {
-            font-family: system-ui, -apple-system, sans-serif;
-            margin: 0;
-            padding: 0;
-            background-color: var(--light);
-            color: var(--dark);
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            text-align: center;
-        }
-        .container {
-            max-width: 600px;
-            padding: 2rem;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
-        }
-        h1 {
-            color: var(--primary);
-            font-size: 2.5rem;
-            margin-bottom: 1rem;
-        }
-        p {
-            font-size: 1.1rem;
-            line-height: 1.6;
-            color: #475569;
-        }
-        .badge {
-            display: inline-block;
-            background-color: #dbeafe;
-            color: var(--primary);
-            padding: 0.25rem 0.75rem;
-            border-radius: 9999px;
-            font-weight: 600;
-            font-size: 0.875rem;
-            margin-bottom: 1rem;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="badge">Live on Azure</div>
-        <h1>Hello from your new laptop!</h1>
-        <p>This static web app was built locally in VS Code and deployed to Azure Static Web Apps using the SWA CLI.</p>
-    </div>
-</body>
-</html>
+import streamlit as st
+from databricks.connect import DatabricksSession
+
+# Initialize Databricks Session (Uses App's managed identity/user context)
+spark = DatabricksSession.builder.getOrCreate()
+
+# Configure your target Unity Catalog destination
+CATALOG = "main"
+SCHEMA = "default"
+TABLE_NAME = "user_inputs"
+FULL_TABLE_PATH = f"{CATALOG}.{SCHEMA}.{TABLE_NAME}"
+
+# Streamlit UI Configuration
+st.set_page_config(page_title="Databricks Data Entry App", layout="centered")
+st.title("📥 Unity Catalog Data Entry")
+st.write("Enter the details below to append a new record to the catalog.")
+
+# 1. Initialize the table if it doesn't exist
+# (In production, you'd typically manage this schema via DDL scripts beforehand)
+setup_query = f"""
+CREATE TABLE IF NOT EXISTS {FULL_TABLE_PATH} (
+    user_name STRING,
+    department STRING,
+    submission_notes STRING,
+    submission_timestamp TIMESTAMP
+) USING DELTA;
+"""
+try:
+    spark.sql(setup_query)
+except Exception as e:
+    st.error(f"Failed to verify/create table: {e}")
+
+# 2. User Input Form
+with st.form("input_form", clear_on_submit=True):
+    user_name = st.text_input("Full Name")
+    department = st.selectbox("Department", ["Engineering", "Data Science", "Product", "Operations"])
+    notes = st.text_area("Notes/Comments")
+    
+    submit_button = st.form_submit_button(label="Submit to Catalog")
+
+# 3. Form Submission Logic
+if submit_button:
+    if not user_name.strip():
+        st.warning("Please enter a name before submitting.")
+    else:
+        # Construct the SQL INSERT statement safely using parameterized variables
+        insert_query = f"""
+            INSERT INTO {FULL_TABLE_PATH} 
+            VALUES (:name, :dept, :notes, current_timestamp())
+        """
+        
+        try:
+            # Execute the insert using Spark SQL parameters to prevent injection
+            spark.sql(
+                insert_query, 
+                args={
+                    "name": user_name, 
+                    "dept": department, 
+                    "notes": notes
+                }
+            )
+            st.success(f"🎉 Successfully inserted record for {user_name} into {FULL_TABLE_PATH}!")
+            
+        except Exception as e:
+            st.error(f"An error occurred while writing to the database: {e}")
+
+# 4. Data Preview Section (Optional)
+st.write("---")
+st.subheader("📋 Recent Submissions")
+try:
+    # Read back the data to show immediate feedback
+    df = spark.sql(f"SELECT * FROM {FULL_TABLE_PATH} ORDER BY submission_timestamp DESC LIMIT 5").toPandas()
+    if not df.empty:
+        st.dataframe(df, use_container_width=True)
+    else:
+        st.info("No records found in the table yet.")
+except Exception as e:
+    st.caption(f"Could not load preview: {e}")
