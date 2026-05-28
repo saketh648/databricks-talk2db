@@ -1,16 +1,12 @@
-AzureDiagnostics
-| where Category == "ExecRequests"
-| extend UserLogin = coalesce(
-    column_ifexists("LoginName_s", ""), 
-    column_ifexists("database_principal_name_s", ""), 
-    column_ifexists("PrincipalName_s", ""),
-    column_ifexists("Caller_s", "")
-)
+SynapseSqlPoolExecRequests
+| where TimeGenerated > ago(24h)
 | project 
-    TimeGenerated, 
-    UserLogin, 
-    Command_s, 
-    DurationMs_d, 
-    ExecutionStatus_s
-| where isnotempty(UserLogin)
-| order by TimeGenerated desc
+    TimeGenerated,
+    RequestId,
+    LoginName,
+    Command,
+    StartTime,
+    EndTime,
+    TotalElapsedTime,
+    Status
+| order by StartTime desc
