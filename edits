@@ -1,9 +1,16 @@
-SynapseSqlPoolExecRequests
+AzureDiagnostics
+| where Category == "ExecRequests"
+| extend UserLogin = coalesce(
+    column_ifexists("LoginName_s", ""), 
+    column_ifexists("database_principal_name_s", ""), 
+    column_ifexists("PrincipalName_s", ""),
+    column_ifexists("Caller_s", "")
+)
 | project 
     TimeGenerated, 
-    LoginName = DatabasePrincipalName, // Or use 'ClientCorrelationId' depending on setup
-    ResourceClass, 
-    Command, 
-    DurationMs = datetime_diff('millisecond', EndTime, StartTime),
-    Status
+    UserLogin, 
+    Command_s, 
+    DurationMs_d, 
+    ExecutionStatus_s
+| where isnotempty(UserLogin)
 | order by TimeGenerated desc
