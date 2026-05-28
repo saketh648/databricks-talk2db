@@ -1,9 +1,9 @@
-AzureDiagnostics
-| where Category == "ExecRequests"
-| where ResourceProvider == "MICROSOFT.SYNAPSE" or ResourceProvider == "MICROSOFT.SQL"
-| summarize 
-    QueryCount = count(), 
-    TotalDurationMinutes = round(sum(DurationMs_d) / 1000 / 60, 2),
-    MaxQueryDurationMins = round(max(DurationMs_d) / 1000 / 60, 2)
-    by LoginName_s
-| order by TotalDurationMinutes desc
+SynapseSqlPoolExecRequests
+| project 
+    TimeGenerated, 
+    LoginName = DatabasePrincipalName, // Or use 'ClientCorrelationId' depending on setup
+    ResourceClass, 
+    Command, 
+    DurationMs = datetime_diff('millisecond', EndTime, StartTime),
+    Status
+| order by TimeGenerated desc
