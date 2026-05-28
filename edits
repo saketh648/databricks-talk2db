@@ -1,58 +1,61 @@
-import streamlit as st
-import pandas as pd
-from databricks import sql
-
-# ── 1. CLUSTER CONNECTION PROPERTIES ────────────────────────────────────
-SERVER_HOSTNAME = "your-server-hostname.azuredatabricks.net"
-HTTP_PATH       = "sql/protocolv1/o/xxxxxx/xxxxxx"
-TARGET_TABLE    = "dev.mma_entityresolution.user_requests"
-
-st.set_page_config(page_title="Databricks Form Engine", layout="centered")
-st.title("🏦 Enterprise Operational Form Portal")
-
-# ── 2. USER INTERFACE FRONT-END GRID ────────────────────────────────────
-with st.form("user_form", clear_on_submit=True):
-    st.subheader("📝 Record Entry Form")
-    name = st.text_input("Full Name", placeholder="e.g. John Doe")
-    email = st.text_input("Corporate Email Address", placeholder="e.g. j.doe@company.com")
-    environment = st.selectbox("Deployment Environment Tier", ["Dev", "QA", "Prod"], index=0)
-    submitted = st.form_submit_button("🚀 Submit to Unity Catalog")
-
-# ── 3. DATA STREAM ROUTING WITH AUTO-COMMIT ─────────────────────────────
-if submitted:
-    if name and email:
-        with st.spinner("Streaming record through secure cluster proxy..."):
-            try:
-                connection = sql.connect(
-                    server_hostname=SERVER_HOSTNAME,
-                    http_path=HTTP_PATH,
-                    auth_type="databricks-oauth" 
-                )
-                
-                cursor = connection.cursor()
-                
-                safe_name = name.replace("'", "''")
-                safe_email = email.replace("'", "''")
-                safe_env = environment.replace("'", "''")
-                
-                insert_query = f"""
-                INSERT INTO {TARGET_TABLE} (name, email, environment)
-                VALUES ('{safe_name}', '{safe_email}', '{safe_env}')
-                """
-                
-                # Execute the write
-                cursor.execute(insert_query)
-                
-                # 🚀 THE CRITICAL FIX: Force the cluster to commit the transaction to disk
-                connection.commit() 
-                
-                cursor.close()
-                connection.close()
-                
-                st.success("🎉 Form data recorded and committed successfully in Unity Catalog!")
-                st.balloons()
-                
-            except Exception as e:
-                st.error(f"❌ Execution Halted: {str(e)}")
-    else:
-        st.error("⚠️ Submission blocked: Please ensure both Name and Email fields are fully populated.")
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome to My Static Site</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --dark: #0f172a;
+            --light: #f8fafc;
+        }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--light);
+            color: var(--dark);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            text-align: center;
+        }
+        .container {
+            max-width: 600px;
+            padding: 2rem;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+        }
+        h1 {
+            color: var(--primary);
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+        }
+        p {
+            font-size: 1.1rem;
+            line-height: 1.6;
+            color: #475569;
+        }
+        .badge {
+            display: inline-block;
+            background-color: #dbeafe;
+            color: var(--primary);
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            font-weight: 600;
+            font-size: 0.875rem;
+            margin-bottom: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="badge">Live on Azure</div>
+        <h1>Hello from your new laptop!</h1>
+        <p>This static web app was built locally in VS Code and deployed to Azure Static Web Apps using the SWA CLI.</p>
+    </div>
+</body>
+</html>
