@@ -1,200 +1,39 @@
-import streamlit as st
-from databricks import sql
-import os
+# Notebook Name: trigger_insert_notebook
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# 1. Define the parameters the notebook expects from the app
+dbutils.widgets.text("user_name", "")
+dbutils.widgets.text("department", "")
+dbutils.widgets.text("notes", "")
 
-st.set_page_config(
-page_title=“User Registration”,
-page_icon=“👤”,
-layout=“centered”,
-)
+# 2. Retrieve the passed parameters
+name = dbutils.widgets.get("user_name")
+dept = dbutils.widgets.get("department")
+notes = dbutils.widgets.get("notes")
 
-# ── CONFIG — change these to match your Unity Catalog ────────────────────────
+# Basic validation guardrail
+if not name:
+    raise ValueError("User name parameter cannot be empty.")
 
-CATALOG    = “main”
-SCHEMA     = “default”
-TABLE      = “user_registrations”
-FULL_TABLE = f”{CATALOG}.{SCHEMA}.{TABLE}”
+# 3. Create the table if it doesn't exist
+CATALOG = "main"
+SCHEMA = "default"
+TABLE_NAME = "user_inputs"
+FULL_TABLE_PATH = f"{CATALOG}.{SCHEMA}.{TABLE_NAME}"
 
-# ── Databricks SQL connection (uses built-in env vars in Databricks Apps) ─────
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {FULL_TABLE_PATH} (
+    user_name STRING,
+    department STRING,
+    submission_notes STRING,
+    submission_timestamp TIMESTAMP
+) USING DELTA;
+""")
 
-@st.cache_resource
-def get_connection():
-return sql.connect(
-server_hostname = os.environ[“DATABRICKS_HOST”],
-http_path       = os.environ[“DATABRICKS_HTTP_PATH”],   # set in app config
-access_token    = os.environ[“DATABRICKS_TOKEN”],
-)
+# 4. Insert the parameterized data
+insert_query = f"""
+    INSERT INTO {FULL_TABLE_PATH} 
+    VALUES (:name, :dept, :notes, current_timestamp())
+"""
 
-def run_sql(query: str, fetch: bool = False):
-conn   = get_connection()
-cursor = conn.cursor()
-cursor.execute(query)
-if fetch:
-cols = [d[0] for d in cursor.description]
-rows = cursor.fetchall()
-return cols, rows
-cursor.close()
-
-# ── Ensure table exists ───────────────────────────────────────────────────────
-
-def ensure_table():
-run_sql(f”””
-CREATE TABLE IF NOT EXISTS {FULL_TABLE} (
-id          BIGINT GENERATED ALWAYS AS IDENTITY,
-username    STRING    NOT NULL,
-email       STRING    NOT NULL,
-environment STRING    NOT NULL,
-created_at  TIMESTAMP NOT NULL DEFAULT current_timestamp()
-)
-USING DELTA
-COMMENT ‘User registrations collected via Streamlit app’
-“””)
-
-# ── Styling ───────────────────────────────────────────────────────────────────
-
-st.markdown(”””
-
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
-
-    html, body, [class*="css"] {
-        font-family: 'IBM Plex Sans', sans-serif;
-    }
-    .block-container { padding-top: 2.5rem; max-width: 680px; }
-
-    h1 { font-family: 'IBM Plex Mono', monospace; font-size: 1.6rem; letter-spacing: -0.5px; }
-
-    .stTextInput > label, .stSelectbox > label {
-        font-size: 0.8rem;
-        font-weight: 600;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: #888;
-    }
-
-    .stButton > button {
-        border-radius: 4px;
-        font-family: 'IBM Plex Mono', monospace;
-        font-size: 0.85rem;
-        font-weight: 600;
-        letter-spacing: 0.05em;
-    }
-
-    .record-card {
-        background: #f8f9fb;
-        border: 1px solid #e4e7ec;
-        border-left: 4px solid #1a73e8;
-        border-radius: 6px;
-        padding: 10px 16px;
-        margin-bottom: 8px;
-        font-size: 0.88rem;
-    }
-    .env-badge {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.75rem;
-        font-weight: 600;
-        font-family: 'IBM Plex Mono', monospace;
-    }
-    .env-prod { background: #fdecea; color: #c0392b; }
-    .env-dev  { background: #e8f5e9; color: #27ae60; }
-</style>
-
-“””, unsafe_allow_html=True)
-
-# ── Initialise table once ─────────────────────────────────────────────────────
-
-try:
-ensure_table()
-except Exception as e:
-st.error(f”Could not connect to Databricks or create table: {e}”)
-st.stop()
-
-# ── UI ────────────────────────────────────────────────────────────────────────
-
-st.title(“User Registration”)
-st.markdown(f”Records are saved to **`{FULL_TABLE}`**”)
-st.divider()
-
-tab_register, tab_view = st.tabs([“➕  Register User”, “📋  View Records”])
-
-# ── Tab 1: Register ───────────────────────────────────────────────────────────
-
-with tab_register:
-st.markdown(”#### New User”)
-
-```
-with st.form("registration_form", clear_on_submit=True):
-    username = st.text_input("Username", placeholder="e.g. john_doe")
-    email    = st.text_input("Email", placeholder="e.g. john@example.com")
-    env      = st.selectbox("Environment", options=["dev", "prod"])
-    submitted = st.form_submit_button("Submit", use_container_width=True, type="primary")
-
-if submitted:
-    # ── Validation ────────────────────────────────────────────────────────
-    errors = []
-    if not username.strip():
-        errors.append("Username is required.")
-    elif len(username.strip()) < 3:
-        errors.append("Username must be at least 3 characters.")
-    if not email.strip():
-        errors.append("Email is required.")
-    elif "@" not in email or "." not in email.split("@")[-1]:
-        errors.append("Please enter a valid email address.")
-
-    if errors:
-        for err in errors:
-            st.error(err)
-    else:
-        safe_user  = username.strip().replace("'", "''")
-        safe_email = email.strip().replace("'", "''")
-        try:
-            run_sql(f"""
-                INSERT INTO {FULL_TABLE} (username, email, environment)
-                VALUES ('{safe_user}', '{safe_email}', '{env}')
-            """)
-            st.success(f"✅ **{username.strip()}** registered successfully as **{env}**!")
-        except Exception as ex:
-            st.error(f"Insert failed: {ex}")
-```
-
-# ── Tab 2: View Records ───────────────────────────────────────────────────────
-
-with tab_view:
-st.markdown(”#### Registered Users”)
-
-```
-col_refresh, col_filter = st.columns([1, 2])
-with col_refresh:
-    refresh = st.button("🔄 Refresh", use_container_width=True)
-with col_filter:
-    filter_env = st.selectbox("Filter by environment", ["All", "dev", "prod"], label_visibility="collapsed")
-
-where = "" if filter_env == "All" else f"WHERE environment = '{filter_env}'"
-try:
-    cols, rows = run_sql(
-        f"SELECT id, username, email, environment, created_at FROM {FULL_TABLE} {where} ORDER BY created_at DESC LIMIT 100",
-        fetch=True,
-    )
-
-    if not rows:
-        st.info("No records found.")
-    else:
-        st.caption(f"{len(rows)} record(s)")
-        for row in rows:
-            rec = dict(zip(cols, row))
-            badge_class = "env-prod" if rec["environment"] == "prod" else "env-dev"
-            st.markdown(f"""
-            <div class="record-card">
-                <strong>{rec['username']}</strong> &nbsp;
-                <span class="env-badge {badge_class}">{rec['environment']}</span><br/>
-                <span style="color:#555">{rec['email']}</span>
-                <span style="float:right;color:#aaa;font-size:0.8rem">{str(rec['created_at'])[:19]}</span>
-            </div>
-            """, unsafe_allow_html=True)
-except Exception as ex:
-    st.error(f"Could not load records: {ex}")
-```
+spark.sql(insert_query, args={"name": name, "dept": dept, "notes": notes})
+print(f"Successfully inserted record for {name}")
