@@ -1,11 +1,9 @@
 AzureDiagnostics
 | where Category == "ExecRequests"
 | where ResourceProvider == "MICROSOFT.SYNAPSE" or ResourceProvider == "MICROSOFT.SQL"
-| project 
-    TimeGenerated, 
-    LoginName_s, 
-    ResourceClass_s, 
-    Command_s, 
-    DurationMs_d, 
-    ExecutionStatus_s
-| order by TimeGenerated desc
+| summarize 
+    QueryCount = count(), 
+    TotalDurationMinutes = round(sum(DurationMs_d) / 1000 / 60, 2),
+    MaxQueryDurationMins = round(max(DurationMs_d) / 1000 / 60, 2)
+    by LoginName_s
+| order by TotalDurationMinutes desc
