@@ -1,2 +1,2 @@
-streamlit
-databricks-sdk
+streamlit>=1.32.0
+databricks-sql-connector>=3.0.0
