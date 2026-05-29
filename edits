@@ -1,14 +1,16 @@
+let auditLogins = AzureDiagnostics
+| where Category == "SQLSecurityAuditEvents"
+| project SessionId = session_id_d, LoginName = server_principal_name_s;
 SynapseSqlPoolExecRequests
 | where TimeGenerated > ago(24h)
 | summarize
-    StartTime           = max(StartTime),
-    EndTime             = max(EndTime),
-    SubmitTime          = max(SubmitTime),
-    Status              = min(Status),
-    Command             = any(Command),
-    StatementType       = any(StatementType),
-    SessionId           = any(SessionId),
-    ClientCorrelationId = any(ClientCorrelationId)
+    StartTime     = max(StartTime),
+    EndTime       = max(EndTime),
+    Status        = min(Status),
+    Command       = any(Command),
+    SessionId     = any(SessionId)
   by RequestId
 | extend DurationSec = (EndTime - StartTime) / 1s
+| join kind=leftouter auditLogins on SessionId
+| project RequestId, LoginName, SessionId, StartTime, EndTime, DurationSec, Status, Command
 | order by StartTime desc
