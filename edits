@@ -1,12 +1,14 @@
 SynapseSqlPoolExecRequests
 | where TimeGenerated > ago(24h)
-| project 
-    TimeGenerated,
-    RequestId,
-    LoginName,
-    Command,
-    StartTime,
-    EndTime,
-    TotalElapsedTime,
-    Status
+| summarize
+    StartTime           = max(StartTime),
+    EndTime             = max(EndTime),
+    SubmitTime          = max(SubmitTime),
+    Status              = min(Status),
+    Command             = any(Command),
+    StatementType       = any(StatementType),
+    SessionId           = any(SessionId),
+    ClientCorrelationId = any(ClientCorrelationId)
+  by RequestId
+| extend DurationSec = (EndTime - StartTime) / 1s
 | order by StartTime desc
