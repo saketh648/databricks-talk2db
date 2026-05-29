@@ -1,4 +1,13 @@
 AzureDiagnostics
-| where Category == "SQLSecurityAuditEvents"
+| distinct Category
+
+
+AzureDiagnostics
+| where ResourceType == "SQLPOOLS"
 | take 1
-| project-keep *session*
+| transpose
+
+
+search *
+| distinct $table
+| sort by $table asc
