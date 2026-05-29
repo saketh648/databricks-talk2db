@@ -1,15 +1,3 @@
-SynapseSqlPoolExecRequests
-| getschema
-
-SynapseSqlPoolWaits
-| getschema
-
-SynapseSqlPoolDmsWorkers
-| getschema
-
-
 AzureDiagnostics
-| where ResourceType == "SQLPOOLS"
-| take 1
-| getschema
-
+| where Category == "ExecRequests" or Category == "SQLSecurityAuditEvents"
+| take 5
