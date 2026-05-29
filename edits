@@ -1,3 +1,4 @@
 AzureDiagnostics
 | where Category == "ExecRequests" or Category == "SQLSecurityAuditEvents"
 | take 5
+npx @azure/static-web-apps-cli deploy ./ --deployment-token "YOUR_AZURE_DEPLOYMENT_TOKEN" --env production
