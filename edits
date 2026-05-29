@@ -1,13 +1,15 @@
-SynapseSqlPoolSqlRequests
-| join kind=leftouter (
-    SynapseSqlPoolExecRequests
-    | summarize
-        StartTime   = max(StartTime),
-        EndTime     = max(EndTime),
-        Status      = min(Status),
-        Command     = any(Command)
-      by RequestId
-) on RequestId
-| extend DurationSec = (EndTime - StartTime) / 1s
-| project RequestId, StartTime, EndTime, DurationSec, Status, Command
-| order by StartTime desc
+SynapseSqlPoolExecRequests
+| getschema
+
+SynapseSqlPoolWaits
+| getschema
+
+SynapseSqlPoolDmsWorkers
+| getschema
+
+
+AzureDiagnostics
+| where ResourceType == "SQLPOOLS"
+| take 1
+| getschema
+
