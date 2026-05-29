@@ -1,13 +1,13 @@
-AzureDiagnostics
-| distinct Category
-
-
-AzureDiagnostics
-| where ResourceType == "SQLPOOLS"
-| take 1
-| transpose
-
-
-search *
-| distinct $table
-| sort by $table asc
+SynapseSqlPoolSqlRequests
+| join kind=leftouter (
+    SynapseSqlPoolExecRequests
+    | summarize
+        StartTime   = max(StartTime),
+        EndTime     = max(EndTime),
+        Status      = min(Status),
+        Command     = any(Command)
+      by RequestId
+) on RequestId
+| extend DurationSec = (EndTime - StartTime) / 1s
+| project RequestId, StartTime, EndTime, DurationSec, Status, Command
+| order by StartTime desc
