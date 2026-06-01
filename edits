@@ -1,3 +1,13 @@
-SynapseDedicatedSqlPoolExecRequests
+AzureDiagnostics
+| where ResourceProvider == "MICROSOFT.SYNAPSE"
+| where Category == "SynapseDedicatedSqlPoolExecRequests"
 | take 10
-| project TimeGenerated, requestId_s, loginName_s, status_s, durationMs_d, command_s
+| project 
+    TimeGenerated, 
+    LogicalServerName_s, 
+    DatabaseName_s, 
+    requestId_s, 
+    loginName_s, 
+    status_s, 
+    durationMs_d, 
+    command_s
