@@ -1,23 +1,3 @@
-SELECT 
-    s.[login_name] AS [User],
-    r.[request_id] AS [Request_ID],
-    r.[status] AS [Status],
-    r.[submit_time] AS [Submit_Time],
-    r.[start_time] AS [Start_Time],
-    r.[end_time] AS [End_Time],
-    -- Calculate durations in seconds
-    DATEDIFF(second, r.[submit_time], r.[start_time]) AS [Queue_Time_Sec],
-    DATEDIFF(second, r.[start_time], r.[end_compile_time]) AS [Compile_Time_Sec],
-    DATEDIFF(second, r.[end_compile_time], r.[end_time]) AS [Execution_Time_Sec],
-    r.[total_elapsed_time] / 1000 AS [Total_Elapsed_Time_Sec],
-    r.[command] AS [Query_Text],
-    r.[label] AS [Query_Label]
-FROM 
-    sys.dm_pdw_exec_requests r
-JOIN 
-    sys.dm_pdw_exec_sessions s ON r.[session_id] = s.[session_id]
-WHERE 
-    r.[session_id] <> SESSION_ID() -- Exclude your current monitoring query
-    -- AND s.[login_name] = 'target_user_here' -- Optional filter by user
-ORDER BY 
-    r.[submit_time] DESC;
+SynapseDedicatedSqlPoolExecRequests
+| take 10
+| project TimeGenerated, requestId_s, loginName_s, status_s, durationMs_d, command_s
