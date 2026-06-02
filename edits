@@ -1,7 +1,7 @@
 let userFilter = "{UserSearch}";
 let selectedPool = "{PoolType}";
 //
-// 1. Gather Dedicated Pool Telemetry using only columns verified in your screenshots
+// 1. Gather Dedicated Pool Telemetry
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
     | where selectedPool in ("All", "Dedicated")
@@ -17,9 +17,9 @@ let dedicatedQueries =
         QueryText = Command,
         Status = Status;
 //
-// 2. Gather Serverless Pool Telemetry 
+// 2. Gather Serverless Pool Telemetry (Fixed table name here!)
 let serverlessQueries = 
-    SynapseBuiltinSqlPoolRequests
+    SynapseBuiltinSqlPoolRequestsEnded
     | where selectedPool in ("All", "Serverless")
     | where isempty(userFilter) or Identity has userFilter or QueryText has userFilter
     | project 
