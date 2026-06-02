@@ -1,38 +1,73 @@
+%pip install azure-monitor-query azure-identity pandas --quiet
+
+from azure.identity import DefaultAzureCredential
+from azure.monitor.query import LogsQueryClient, LogsQueryStatus
 from pyspark.sql import functions as F
+from pyspark.sql.types import *
+import pandas as pd
 
-# 1. Grab your security token
-token = mssparkutils.credentials.getToken("DW")
+# 1. CONFIGURE YOUR TARGET LOG ANALYTICS WORKSPACE
+# You can grab this GUID from the Overview page of your Log Analytics Workspace in Azure
+log_analytics_workspace_id = "YOUR-LOG-ANALYTICS-WORKSPACE-ID-GUID" 
 
-# 2. Point to your specific serverless on-demand endpoint
-# TODO: Update with your exact workspace serverless name prefix
-serverless_sql_endpoint = "yourworkspace-ondemand.sql.azuresynapse.net" 
-serverless_jdbc_url = f"jdbc:sqlserver://{serverless_sql_endpoint}:1433;database=master"
+# 2. INITIALIZE SECURITY & CLIENT CONTEXT
+# This sniffs your current logged-in Synapse account/token context automatically
+credential = DefaultAzureCredential()
+logs_client = LogsQueryClient(credential)
 
-# 3. Direct query targeting the hidden history DMV
-test_history_query = """
-(
-    SELECT TOP 10
-        r.request_id AS ReqId,
-        r.login_name AS UserIdentity,
-        r.start_time AS SubmitTime,
-        DATEDIFF(second, r.start_time, r.end_time) AS DurationSec,
-        r.command AS QueryText,
-        r.status AS Status,
-        CAST(r.data_processed_mb AS float) AS DataProcessedMB
-    FROM sys.dm_exec_requests_history r
-    ORDER BY r.end_time DESC
-) AS test_hist
+# 3. CONSTRUCT THE KUSTO QUERY (KQL)
+# This targets the specific Serverless request engine logs for the past 24 hours
+kql_query = """
+SynapseBuiltinSqlPoolRequestsEnded
+| where TimeGenerated >= ago(24h)
+| project 
+    RequestId, 
+    Identity, 
+    StartTime, 
+    DurationSec = datetime_diff('second', EndTime, StartTime), 
+    QueryText, 
+    Status, 
+    DataProcessedGB = round(dataProcessedBytes_d / (1024.0 * 1024.0 * 1024.0), 3)
+| order by StartTime desc
 """
 
-print("Testing direct serverless connection to history logs...")
+print(f"Connecting to Log Analytics Workspace ({log_analytics_workspace_id})...")
+
 try:
-    test_df = spark.read.format("jdbc") \
-        .option("url", serverless_jdbc_url) \
-        .option("dbtable", test_history_query) \
-        .option("accessToken", token) \
-        .load()
+    # 4. EXECUTE THE KQL QUERY
+    response = logs_client.query_workspace(
+        workspace_id=log_analytics_workspace_id, 
+        query=kql_query, 
+        timespan=None
+    )
+    
+    # 5. CONVERT AND TRANSFORM RESULT SETS
+    if response.status == LogsQueryStatus.SUCCESS:
+        raw_table = response.tables[0]
         
-    print(f"Success! Retrieved {test_df.count()} historical serverless rows.")
-    display(test_df)
-except Exception as e:
-    print(f"Connection failed or view not accessible. Error: {str(e)}")
+        # Pull raw rows into a standard Pandas Frame
+        pandas_df = pd.DataFrame(raw_table.rows, columns=[col.name for col in raw_table.columns])
+        
+        if not pandas_df.empty:
+            # Convert Pandas frame directly into a native Spark Dataframe
+            spark_serverless_df = spark.createDataFrame(pandas_df)
+            
+            # Calculate the exact individual cost per query ($5.00 per TB / $0.0048828 per GB)
+            spark_serverless_df = spark_serverless_df.withColumn(
+                "EstimatedCostUSD", 
+                F.round(F.col("DataProcessedGB") * 0.0048828, 4)
+            )
+            
+            print(f"Success! Retrieved {spark_serverless_df.count()} historical Serverless queries.")
+            
+            # 6. DISPLAY THE RESULTS (Can be toggled to Chart View)
+            display(spark_serverless_df)
+            
+        else:
+            print("Connected successfully, but zero Serverless queries were executed in the past 24 hours.")
+            
+    else:
+        print(f"Log Analytics Execution Failure: {response.errors}")
+
+except Exception as err:
+    print(f"Failed to query Azure Monitor logs. Verify your Workspace ID and permissions. Error details:\n{str(err)}")
