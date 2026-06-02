@@ -1,19 +1,26 @@
-
-// 1. Gather Dedicated Pool Telemetry
+// 1. Map Dedicated Session IDs to their true Human Login Identities
+let dedicatedUserMap = 
+    SynapseSqlPoolSqlRequests
+    | where isnotempty(LoginName)
+    | summarize TakeUser = any(LoginName) by SessionId;
+//
+// 2. Gather Dedicated Pool Telemetry linked to the User Map
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
     | where TimeGenerated >= ago(24h)
+    | join kind=leftouter dedicatedUserMap on SessionId
     | project 
         ReqId = tostring(column_ifexists("RequestId", "")),
         PoolType = "Dedicated",
-        User = iff(isnotempty(ClientCorrelationId), ClientCorrelationId, "System/Service"),
+        -- If the join finds a user identity, use it; otherwise fallback to the system client app name
+        User = iff(isnotempty(TakeUser), TakeUser, iff(isnotempty(ClientCorrelationId), ClientCorrelationId, "System/Service")),
         SubmitTime = SubmitTime,
         EndTime = EndTime,
         DurationSec = datetime_diff('second', EndTime, StartTime),
         QueryText = Command,
         Status = Status;
 //
-// 2. Gather Serverless Pool Telemetry (Using full safe column-sniffing fallbacks)
+// 3. Gather Serverless Pool Telemetry
 let serverlessQueries = 
     SynapseBuiltinSqlPoolRequestsEnded
     | where TimeGenerated >= ago(24h)
@@ -30,6 +37,6 @@ let serverlessQueries =
         QueryText = tostring(column_ifexists("QueryText", column_ifexists("queryText_s", "Internal Command"))),
         Status = tostring(column_ifexists("Status", column_ifexists("status_s", "Completed")));
 //
-// 3. Combine and Display Results
+// 4. Combine and Display Results
 union dedicatedQueries, serverlessQueries
 | order by SubmitTime desc
