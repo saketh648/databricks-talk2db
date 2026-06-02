@@ -170,3 +170,10 @@ final_filtered_df = dashboard_master_df.filter((F.col("PoolType") == v_type) | (
 final_filtered_df.cache()
 print("\n--- Dashboard Refresh Complete! ---")
 print(f"Current View Metrics -> Type: {v_type} | Pool: {v_name} | Lookback Window: {v_time}")
+
+
+
+
+
+
+display(final_filtered_df)
