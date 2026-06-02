@@ -17,21 +17,32 @@ let dedicatedQueries =
         QueryText = Command,
         Status = Status;
 //
-// 2. Gather Serverless Pool Telemetry (Fixed table name here!)
+// 2. Safely probe for the Serverless table using dynamically resolved execution
 let serverlessQueries = 
-    SynapseBuiltinSqlPoolRequestsEnded
+    table("SynapseBuiltinSqlPoolRequestsEnded", true) // The 'true' flag skips compilation failure if missing
     | where selectedPool in ("All", "Serverless")
-    | where isempty(userFilter) or Identity has userFilter or QueryText has userFilter
+    | extend ExtUser = coalesce(
+        tostring(column_ifexists("Identity", "")), 
+        tostring(column_ifexists("identity_s", ""))
+      )
+    | extend ExtQueryText = coalesce(
+        tostring(column_ifexists("QueryText", "")), 
+        tostring(column_ifexists("queryText_s", ""))
+      )
+    | where isempty(userFilter) or ExtUser has userFilter or ExtQueryText has userFilter
     | project 
-        RequestId = RequestId,
+        RequestId = tostring(column_ifexists("RequestId", column_ifexists("requestId_s", ""))),
         PoolType = "Serverless",
-        User = Identity,
-        SubmitTime = StartTime,
-        EndTime = EndTime,
-        DurationSec = datetime_diff('second', EndTime, StartTime),
+        User = iff(ExtUser != "", ExtUser, "System/Internal"),
+        SubmitTime = todatetime(column_ifexists("StartTime", column_ifexists("startTime_t", TimeGenerated))),
+        EndTime = todatetime(column_ifexists("EndTime", column_ifexists("endTime_t", TimeGenerated))),
+        DurationSec = datetime_diff('second', 
+            todatetime(column_ifexists("EndTime", TimeGenerated)), 
+            todatetime(column_ifexists("StartTime", TimeGenerated))
+        ),
         DataProcessedGB = 0.0,
-        QueryText = QueryText,
-        Status = Status;
+        QueryText = ExtQueryText,
+        Status = tostring(column_ifexists("Status", column_ifexists("status_s", "Completed")));
 //
 // 3. Combine and Display Results
 union dedicatedQueries, serverlessQueries
