@@ -1,35 +1,120 @@
-// 1. Gather Dedicated Pool Telemetry (Using ONLY verified snapshot columns)
-let dedicatedQueries = 
-    SynapseSqlPoolExecRequests
-    | where TimeGenerated >= ago(24h)
-    | extend CleanUser = tostring(split(ClientCorrelationId, "_")[0])
-    | project 
-        ReqId = RequestId,
-        PoolType = "Dedicated",
-        User = iff(isnotempty(CleanUser), CleanUser, "System/Service"),
-        SubmitTime = StartTime,
-        EndTime = EndTime,
-        DurationSec = datetime_diff('second', EndTime, StartTime),
-        QueryText = Command,
-        Status = Status;
-//
-// 2. Gather Serverless Pool Telemetry (Protected with safe fallbacks)
-let serverlessQueries = 
-    SynapseBuiltinSqlPoolRequestsEnded
-    | where TimeGenerated >= ago(24h)
-    | project 
-        ReqId = tostring(column_ifexists("RequestId", column_ifexists("requestId", ""))),
-        PoolType = "Serverless",
-        User = tostring(column_ifexists("Identity", column_ifexists("identity_s", "System/Service"))),
-        SubmitTime = todatetime(column_ifexists("StartTime", column_ifexists("startTime_t", TimeGenerated))),
-        EndTime = todatetime(column_ifexists("EndTime", column_ifexists("endTime_t", TimeGenerated))),
-        DurationSec = datetime_diff('second', 
-            todatetime(column_ifexists("EndTime", TimeGenerated)), 
-            todatetime(column_ifexists("StartTime", TimeGenerated))
-        ),
-        QueryText = tostring(column_ifexists("QueryText", column_ifexists("queryText_s", "Internal Query"))),
-        Status = tostring(column_ifexists("Status", column_ifexists("status_s", "Completed")));
-//
-// 3. Combine and Display Results
-union dedicatedQueries, serverlessQueries
-| order by SubmitTime desc
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+# -------------------------------------------------------------------------
+# 1. SETUP NOTEBOOK INTERACTIVE DROP-DOWNS (WIDGETS)
+# -------------------------------------------------------------------------
+dbutils.widgets.dropdown("TeamFilter", "All", ["All", "Team_Finance", "Team_Risk", "Team_Marketing"])
+dbutils.widgets.dropdown("PoolTypeFilter", "All", ["All", "Dedicated", "Serverless"])
+
+# -------------------------------------------------------------------------
+# 2. CONFIGURE YOUR 10 TEAMS AND THEIR DEDICATED POOLS
+# -------------------------------------------------------------------------
+# Add all 10 of your dedicated pool setups into this list array
+teams_config = [
+    {"team": "Team_Finance", "pool": "finance_dw", "server": "yourworkspace.sql.azuresynapse.net"},
+    {"team": "Team_Risk", "pool": "risk_dw", "server": "yourworkspace.sql.azuresynapse.net"},
+    {"team": "Team_Marketing", "pool": "marketing_dw", "server": "yourworkspace.sql.azuresynapse.net"},
+]
+
+dedicated_dfs = []
+
+# Loop through each team's dedicated pool via standard JDBC connection
+for cfg in teams_config:
+    jdbc_url = f"jdbc:sqlserver://{cfg['server']}:1433;database={cfg['pool']}"
+    
+    # Securely grab the live Dedicated pool system DMVs
+    dmv_query = """
+    (
+        SELECT 
+            r.request_id AS ReqId,
+            s.login_name AS UserIdentity,
+            r.submit_time AS SubmitTime,
+            DATEDIFF(second, r.start_time, r.end_time) AS DurationSec,
+            r.command AS QueryText,
+            r.status AS Status
+        FROM sys.dm_pdw_exec_requests r
+        JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
+        WHERE r.start_time >= DATEADD(day, -3, GETDATE())
+    ) AS logs
+    """
+    
+    try:
+        tmp_df = spark.read.format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("dbtable", dmv_query) \
+            .option("user", "your_sql_admin_username") \
+            .option("password", "your_sql_password") \
+            .load()
+            
+        # Add metadata tracking tags for your team dashboard matrix
+        tmp_df = tmp_df.withColumn("TeamName", F.lit(cfg["team"])) \
+                       .withColumn("PoolName", F.lit(cfg["pool"])) \
+                       .withColumn("PoolType", F.lit("Dedicated")) \
+                       .withColumn("DataProcessedGB", F.lit(0.0)) \
+                       .withColumn("EstimatedCostUSD", F.lit(0.0))
+        dedicated_dfs.append(tmp_df)
+    except Exception as e:
+        print(f"Skipping {cfg['pool']} - Pool might be paused right now.")
+
+# Union all active dedicated dataframes together
+if dedicated_dfs:
+    all_dedicated_df = dedicated_dfs[0]
+    for next_df in dedicated_dfs[1:]:
+        all_dedicated_df = all_dedicated_df.union(next_df)
+else:
+    all_dedicated_df = None
+
+# -------------------------------------------------------------------------
+# 3. PULL NATIVE SERVERLESS LOGS FROM LOG CONTEXT & COMPUTE COSTS
+# -------------------------------------------------------------------------
+try:
+    # Spark can query the log analytics tables natively if attached as an environment table
+    serverless_raw = spark.read.table("SynapseBuiltinSqlPoolRequestsEnded") \
+        .filter("TimeGenerated >= ago(3d)")
+        
+    serverless_clean = serverless_raw.select(
+        F.col("RequestId").alias("ReqId"),
+        F.col("Identity").alias("UserIdentity"),
+        F.col("StartTime").alias("SubmitTime"),
+        (F.unix_timestamp("EndTime") - F.unix_timestamp("StartTime")).alias("DurationSec"),
+        F.col("QueryText"),
+        F.col("Status")
+    ).withColumn("PoolType", F.lit("Serverless")) \
+     .withColumn("PoolName", F.lit("Built-in")) \
+     .withColumn("TeamName", F.when(F.col("UserIdentity").contains("finance"), "Team_Finance")
+                            .when(F.col("UserIdentity").contains("risk"), "Team_Risk")
+                            .otherwise("Team_Marketing")) \
+     .withColumn("DataProcessedGB", F.round(F.col("dataProcessedBytes_d") / (1024*1024*1024), 3)) \
+     .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4))
+except:
+    # Fallback to an empty schema structure if no serverless records exist yet
+    schema = StructType([
+        StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
+        StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
+        StructField("QueryText", StringType(), True), StructField("Status", StringType(), True),
+        StructField("PoolType", StringType(), True), StructField("PoolName", StringType(), True),
+        StructField("TeamName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
+        StructField("EstimatedCostUSD", DoubleType(), True)
+    ])
+    serverless_clean = spark.createDataFrame([], schema)
+
+# -------------------------------------------------------------------------
+# 4. MERGE RESULTS & APPLY INTERACTIVE WIDGET FILTERS
+# -------------------------------------------------------------------------
+if all_dedicated_df:
+    final_master_df = all_dedicated_df.unionByName(serverless_clean)
+else:
+    final_master_df = serverless_clean
+
+# Read widget filter parameters dynamically
+v_team = dbutils.widgets.get("TeamFilter")
+v_type = dbutils.widgets.get("PoolTypeFilter")
+
+dashboard_display_df = final_master_df \
+    .filter((F.col("TeamName") == v_team) | (F.lit(v_team) == "All")) \
+    .filter((F.col("PoolType") == v_type) | (F.lit(v_type) == "All")) \
+    .orderBy(F.col("SubmitTime").desc())
+
+# Cache it in Spark memory for instant visualization speeds
+dashboard_display_df.cache()
