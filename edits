@@ -29,7 +29,7 @@ let serverlessQueries =
         SubmitTime = startTime_t,
         EndTime = endTime_t,
         DurationSec = round(durationMs_d / 1000.0, 2),
-        -- If dataProcessedBytes_d isn't in this specific table, you can substitute 0.0
+        // If dataProcessedBytes_d isn't in your table, you can change this line to: DataProcessedGB = 0.0
         DataProcessedGB = round(dataProcessedBytes_d / (1024.0 * 1024.0 * 1024.0), 3),
         QueryText = queryText_s,
         Status = status_s;
