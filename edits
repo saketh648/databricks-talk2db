@@ -1,39 +1,3 @@
-import ipywidgets as widgets
-from IPython.display import display as ipydisplay
-
-# The consolidated master list of all 15 of your corporate pools + Serverless
-pool_names_list = [
-    "All",
-    "Care_dev_dedicated",
-    "ac_operations__dev_dedicated_new",
-    "wcib_dev_dedicated",
-    "operations_and_enterprise_prod_dedicated",
-    "marketing_data_products_prod_dedicated",
-    "marketing_activation_dev_dedicated",
-    "special_projects__dev_dedicated",
-    "operations_and_enterprise_dev_dedicated",
-    "marketing_analytics__prod_dedicated",
-    "care_prod_dedicated",
-    "digital_prod_dedicated",
-    "marketing_analytics_dev_dedicated",
-    "digital_dev_dedicated",
-    "locations_analytics_prod_dedicated",
-    "wcib_prod_dedicated",
-    "Built-in (Serverless)"
-]
-
-# Construct persistent Jupyter UI components
-pool_type_w = widgets.Dropdown(options=["All", "Dedicated", "Serverless"], value="All", description="Pool Type:")
-pool_name_w = widgets.Dropdown(options=pool_names_list, value="All", description="Pool Name:")
-time_filter_w = widgets.Dropdown(options=["Past 1 Hour", "Past 4 Hours", "Past 24 Hours", "Past 3 Days"], value="Past 24 Hours", description="Time Range:")
-status_w = widgets.Dropdown(options=["All", "Completed", "Running", "Failed", "Cancelled"], value="All", description="Status:")
-
-print("--- Step 1: Adjust Your Dashboard Scope Filters Below ---")
-ipydisplay(pool_type_w, pool_name_w, time_filter_w, status_w)
-
-
-
-
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
 
@@ -53,7 +17,8 @@ print(f"Starting Extraction -> Scope: Type={v_type} | Pool={v_name} | Lookback={
 
 # 2. ENTRA PASS-THROUGH HANDSHAKE & POOL CONFIG MATRIX
 token = mssparkutils.credentials.getToken("DW")
-synapse_sql_endpoint = "yourworkspace.sql.azuresynapse.net" # <-- UPDATE WITH YOUR WORKSPACE PREFIX
+# TODO: Update with your workspace prefix if needed
+synapse_sql_endpoint = "yourworkspace.sql.azuresynapse.net" 
 
 teams_config = [
     {"team": "Care Team", "pool": "Care_dev_dedicated"},
@@ -90,42 +55,46 @@ dedicated_dmv_query = f"""
 """
 
 dedicated_dfs = []
-for cfg in teams_config:
-    # OPTIMIZATION: Loop bypass. If you picked a specific pool, skip querying the other 14 completely.
-    if v_name != "All" and v_name != cfg["pool"]:
-        continue
+# Only loop through dedicated pools if the user didn't explicitly restrict the search to Serverless
+if v_type.lower() != "serverless" and (v_name == "All" or not "serverless" in v_name.lower()):
+    for cfg in teams_config:
+        if v_name != "All" and v_name != cfg["pool"]:
+            continue
+            
+        jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={cfg['pool']}"
+        print(f" -> Connecting to Live System DMVs: {cfg['pool']}...")
         
-    jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={cfg['pool']}"
-    print(f" -> Connecting to Live System DMVs: {cfg['pool']}...")
-    
-    try:
-        tmp_df = spark.read.format("jdbc").option("url", jdbc_url).option("dbtable", dedicated_dmv_query).option("accessToken", token).load()
-        tmp_df = tmp_df.withColumn("TeamName", F.lit(cfg["team"]))\
-                       .withColumn("PoolName", F.lit(cfg["pool"]))\
-                       .withColumn("PoolType", F.lit("Dedicated"))\
-                       .withColumn("DataProcessedGB", F.lit(0.0))\
-                       .withColumn("EstimatedCostUSD", F.lit(0.0))
-        dedicated_dfs.append(tmp_df)
-    except:
-        print(f"    [Warning] Failed to poll '{cfg['pool']}'. Pool might be scaled down or paused.")
+        try:
+            tmp_df = spark.read.format("jdbc").option("url", jdbc_url).option("dbtable", dedicated_dmv_query).option("accessToken", token).load()
+            tmp_df = tmp_df.withColumn("TeamName", F.lit(cfg["team"]))\
+                           .withColumn("PoolName", F.lit(cfg["pool"]))\
+                           .withColumn("PoolType", F.lit("Dedicated"))\
+                           .withColumn("DataProcessedGB", F.lit(0.0))\
+                           .withColumn("EstimatedCostUSD", F.lit(0.0))
+            dedicated_dfs.append(tmp_df)
+        except:
+            pass
 
-# Consolidate Dedicated dataframes 
+# Schema template blueprint for empty fallbacks
+schema_template = StructType([
+    StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
+    StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
+    StructField("QueryText", StringType(), True), StructField("Status", StringType(), True),
+    StructField("PoolType", StringType(), True), StructField("PoolName", StringType(), True),
+    StructField("TeamName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
+    StructField("EstimatedCostUSD", DoubleType(), True)
+])
+
 if dedicated_dfs:
     master_dedicated_df = dedicated_dfs[0]
     for next_df in dedicated_dfs[1:]: master_dedicated_df = master_dedicated_df.unionByName(next_df)
 else:
-    schema_template = StructType([
-        StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
-        StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
-        StructField("QueryText", StringType(), True), StructField("Status", StringType(), True),
-        StructField("PoolType", StringType(), True), StructField("PoolName", StringType(), True),
-        StructField("TeamName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
-        StructField("EstimatedCostUSD", DoubleType(), True)
-    ])
     master_dedicated_df = spark.createDataFrame([], schema_template)
 
-# 4. SERVERLESS LOG EXTRACTION & PER-QUERY COST CALCULATION
-if v_name == "All" or v_name == "Built-in (Serverless)":
+# 4. REFINED SERVERLESS LOG EXTRACTION WITH FLEXIBLE MATCHER
+master_serverless_df = spark.createDataFrame([], schema_template)
+
+if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
     print(" -> Pulling Serverless Log Registries...")
     try:
         serverless_lookback = '1h' if v_time == 'Past 1 Hour' else '4h' if v_time == 'Past 4 Hours' else '1d' if v_time == 'Past 24 Hours' else '3d'
@@ -138,84 +107,30 @@ if v_name == "All" or v_name == "Built-in (Serverless)":
          .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
          .withColumn("TeamName", F.lit("Shared Infrastructure"))\
          .withColumn("DataProcessedGB", F.round(F.col("dataProcessedBytes_d") / (1024*1024*1024), 3))\
-         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4)) # $5 per TB calculation
-    except:
-        master_serverless_df = spark.createDataFrame([], master_dedicated_df.schema)
-else:
-    master_serverless_df = spark.createDataFrame([], master_dedicated_df.schema)
+         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4))
+    except Exception as serverless_err:
+        print(f"    [Note] No serverless entries extracted or metadata table empty: {str(serverless_err)}")
 
-# 5. UNIFY LOG REPOSITORIES AND APPLY SCOPE BASE FILTERS
+# 5. UNIFY LOG REPOSITORIES AND APPLY FLUID CASE-INSENSITIVE FILTERS
 raw_master_df = master_dedicated_df.unionByName(master_serverless_df)
 
-base_filtered_df = raw_master_df.filter((F.col("PoolType") == v_type) | (F.lit(v_type) == "All")) \
-                                .filter((F.col("Status").rlike(f"(?i){v_status}")) | (F.lit(v_status) == "All"))
+# Hardened Filtration Block using lowercase matching patterns
+base_filtered_df = raw_master_df.filter(
+    (F.lower(F.col("PoolType")) == v_type.lower()) | (F.lit(v_type) == "All")
+).filter(
+    (F.lower(F.col("PoolName")).contains("built-in")) if "serverless" in v_name.lower() else ((F.col("PoolName") == v_name) | (F.lit(v_name) == "All"))
+).filter(
+    (F.col("Status").rlike(f"(?i){v_status}")) | (F.lit(v_status) == "All")
+)
 
-# Cache unified footprint into cluster memory for fast drop-down slicing
+# Cache footprint into memory for instant visual dropdown slicing
 base_filtered_df.cache()
 
-# 6. ASSEMBLE ADAPTIVE USER DROPDOWN SELECTOR FROM UNFILTERED DATA
+# 6. ASSEMBLE USER DROPDOWN SELECTOR FROM THE RESULTS
 unique_users = [row['UserIdentity'] for row in base_filtered_df.select("UserIdentity").distinct().collect() if row['UserIdentity']]
 unique_users.sort()
 unique_users.insert(0, "All")
 
 user_filter_w = widgets.Dropdown(options=unique_users, value="All", description="View User:")
 print(f"\n--- SUCCESS: Logs Loaded! {len(unique_users)-1} active identities detected. ---")
-print("Select a specific user below to filter visual representations dynamically:")
 ipydisplay(user_filter_w)
-
-
-
-
-
-
-
-# Read current choice from the dynamic user widget in Cell 2
-v_user = user_filter_w.value
-
-# Slice in-memory cached logs instantly 
-final_dashboard_df = base_filtered_df.filter((F.col("UserIdentity") == v_user) | (F.lit(v_user) == "All")) \
-                                     .orderBy(F.col("SubmitTime").desc())
-
-print(f"Displaying Interactive Workspace Log Framework For User: {v_user}")
-display(final_dashboard_df)
-
-
-
-
-
-
-
-import time
-
-# 1. EXTRACT RUNNING EXECUTORS AND COMPUTE CAPACITY
-total_nodes = len(sc._jsc.sc().statusTracker().getExecutorInfos())
-core_count_per_node = int(spark.conf.get("spark.executor.cores", "4")) 
-
-# 2. TRACK UPTIME BOUNDS
-uptime_ms = sc._jsc.sc().startTime()
-current_ms = int(round(time.time() * 1000))
-duration_hours = float(current_ms - uptime_ms) / (1000.0 * 60.0 * 60.0)
-
-# 3. CALCULATE vCPU METRIC COSTS ($0.17 per vCPU Hour standard azure billing rate)
-total_vcpu_hours = total_nodes * core_count_per_node * duration_hours
-azure_spark_rate_per_vcpu_hour = 0.1700
-estimated_spark_cost_usd = total_vcpu_hours * azure_spark_rate_per_vcpu_hour
-
-# 4. TABULATE METRIC DISPLAY TILE
-spark_summary_data = [(
-    total_nodes, 
-    f"{core_count_per_node} vCPUs", 
-    f"{round(duration_hours * 60, 1)} Minutes", 
-    round(total_vcpu_hours, 3), 
-    f"${round(estimated_spark_cost_usd, 4)}"
-)]
-
-spark_summary_schema = ["Total Active Nodes", "Node Compute Size", "Notebook Active Uptime", "Total vCPU Hours", "Estimated Cluster Cost (USD)"]
-spark_cost_df = spark.createDataFrame(spark_summary_data, spark_summary_schema)
-
-print("--- Current Spark Cluster Infrastructure Billing Metrics ---")
-display(spark_cost_df)
-
-
-
-
