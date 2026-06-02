@@ -34,3 +34,188 @@ ipydisplay(pool_type_w, pool_name_w, time_filter_w, status_w)
 
 
 
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+# 1. CAPTURE ACTIVE DROPDOWN VALUES FROM CELL 1
+v_type = pool_type_w.value
+v_name = pool_name_w.value
+v_time = time_filter_w.value
+v_status = status_w.value
+
+# Calculate historical lookbacks
+days_lookback = 1; hours_lookback = 0
+if v_time == "Past 1 Hour":   days_lookback = 0; hours_lookback = 1
+elif v_time == "Past 4 Hours": days_lookback = 0; hours_lookback = 4
+elif v_time == "Past 3 Days":  days_lookback = 3; hours_lookback = 0
+
+print(f"Starting Extraction -> Scope: Type={v_type} | Pool={v_name} | Lookback={v_time} | Status={v_status}...\n")
+
+# 2. ENTRA PASS-THROUGH HANDSHAKE & POOL CONFIG MATRIX
+token = mssparkutils.credentials.getToken("DW")
+synapse_sql_endpoint = "yourworkspace.sql.azuresynapse.net" # <-- UPDATE WITH YOUR WORKSPACE PREFIX
+
+teams_config = [
+    {"team": "Care Team", "pool": "Care_dev_dedicated"},
+    {"team": "Operations Team", "pool": "ac_operations__dev_dedicated_new"},
+    {"team": "WCIB Corporate Team", "pool": "wcib_dev_dedicated"},
+    {"team": "Operations Team", "pool": "operations_and_enterprise_prod_dedicated"},
+    {"team": "Marketing Data Team", "pool": "marketing_data_products_prod_dedicated"},
+    {"team": "Marketing Act Team", "pool": "marketing_activation_dev_dedicated"},
+    {"team": "Special Projects Team", "pool": "special_projects__dev_dedicated"},
+    {"team": "Operations Team", "pool": "operations_and_enterprise_dev_dedicated"},
+    {"team": "Marketing Analyt Team", "pool": "marketing_analytics__prod_dedicated"},
+    {"team": "Care Team", "pool": "care_prod_dedicated"},
+    {"team": "Digital Product Team", "pool": "digital_prod_dedicated"},
+    {"team": "Marketing Analyt Team", "pool": "marketing_analytics_dev_dedicated"},
+    {"team": "Digital Product Team", "pool": "digital_dev_dedicated"},
+    {"team": "Location Analyt Team", "pool": "locations_analytics_prod_dedicated"},
+    {"team": "WCIB Corporate Team", "pool": "wcib_prod_dedicated"}
+]
+
+# 3. GENERATE THE DEDICATED DMV PASS-THROUGH T-SQL QUERY
+dedicated_dmv_query = f"""
+(
+    SELECT 
+        r.request_id AS ReqId,
+        s.login_name AS UserIdentity,
+        r.submit_time AS SubmitTime,
+        DATEDIFF(second, r.start_time, r.end_time) AS DurationSec,
+        r.command AS QueryText,
+        r.status AS Status
+    FROM sys.dm_pdw_exec_requests r
+    JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
+    WHERE r.start_time >= DATEADD({ 'hour' if hours_lookback > 0 else 'day' }, -{ hours_lookback if hours_lookback > 0 else days_lookback }, GETDATE())
+) AS logs
+"""
+
+dedicated_dfs = []
+for cfg in teams_config:
+    # OPTIMIZATION: Loop bypass. If you picked a specific pool, skip querying the other 14 completely.
+    if v_name != "All" and v_name != cfg["pool"]:
+        continue
+        
+    jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={cfg['pool']}"
+    print(f" -> Connecting to Live System DMVs: {cfg['pool']}...")
+    
+    try:
+        tmp_df = spark.read.format("jdbc").option("url", jdbc_url).option("dbtable", dedicated_dmv_query).option("accessToken", token).load()
+        tmp_df = tmp_df.withColumn("TeamName", F.lit(cfg["team"]))\
+                       .withColumn("PoolName", F.lit(cfg["pool"]))\
+                       .withColumn("PoolType", F.lit("Dedicated"))\
+                       .withColumn("DataProcessedGB", F.lit(0.0))\
+                       .withColumn("EstimatedCostUSD", F.lit(0.0))
+        dedicated_dfs.append(tmp_df)
+    except:
+        print(f"    [Warning] Failed to poll '{cfg['pool']}'. Pool might be scaled down or paused.")
+
+# Consolidate Dedicated dataframes 
+if dedicated_dfs:
+    master_dedicated_df = dedicated_dfs[0]
+    for next_df in dedicated_dfs[1:]: master_dedicated_df = master_dedicated_df.unionByName(next_df)
+else:
+    schema_template = StructType([
+        StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
+        StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
+        StructField("QueryText", StringType(), True), StructField("Status", StringType(), True),
+        StructField("PoolType", StringType(), True), StructField("PoolName", StringType(), True),
+        StructField("TeamName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
+        StructField("EstimatedCostUSD", DoubleType(), True)
+    ])
+    master_dedicated_df = spark.createDataFrame([], schema_template)
+
+# 4. SERVERLESS LOG EXTRACTION & PER-QUERY COST CALCULATION
+if v_name == "All" or v_name == "Built-in (Serverless)":
+    print(" -> Pulling Serverless Log Registries...")
+    try:
+        serverless_lookback = '1h' if v_time == 'Past 1 Hour' else '4h' if v_time == 'Past 4 Hours' else '1d' if v_time == 'Past 24 Hours' else '3d'
+        serverless_raw = spark.read.table("SynapseBuiltinSqlPoolRequestsEnded").filter(f"StartTime >= ago({serverless_lookback})")
+        
+        master_serverless_df = serverless_raw.select(
+            F.col("RequestId").alias("ReqId"), F.col("Identity").alias("UserIdentity"), F.col("StartTime").alias("SubmitTime"),
+            (F.unix_timestamp("EndTime") - F.unix_timestamp("StartTime")).alias("DurationSec"), F.col("QueryText"), F.col("Status")
+        ).withColumn("PoolType", F.lit("Serverless"))\
+         .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
+         .withColumn("TeamName", F.lit("Shared Infrastructure"))\
+         .withColumn("DataProcessedGB", F.round(F.col("dataProcessedBytes_d") / (1024*1024*1024), 3))\
+         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4)) # $5 per TB calculation
+    except:
+        master_serverless_df = spark.createDataFrame([], master_dedicated_df.schema)
+else:
+    master_serverless_df = spark.createDataFrame([], master_dedicated_df.schema)
+
+# 5. UNIFY LOG REPOSITORIES AND APPLY SCOPE BASE FILTERS
+raw_master_df = master_dedicated_df.unionByName(master_serverless_df)
+
+base_filtered_df = raw_master_df.filter((F.col("PoolType") == v_type) | (F.lit(v_type) == "All")) \
+                                .filter((F.col("Status").rlike(f"(?i){v_status}")) | (F.lit(v_status) == "All"))
+
+# Cache unified footprint into cluster memory for fast drop-down slicing
+base_filtered_df.cache()
+
+# 6. ASSEMBLE ADAPTIVE USER DROPDOWN SELECTOR FROM UNFILTERED DATA
+unique_users = [row['UserIdentity'] for row in base_filtered_df.select("UserIdentity").distinct().collect() if row['UserIdentity']]
+unique_users.sort()
+unique_users.insert(0, "All")
+
+user_filter_w = widgets.Dropdown(options=unique_users, value="All", description="View User:")
+print(f"\n--- SUCCESS: Logs Loaded! {len(unique_users)-1} active identities detected. ---")
+print("Select a specific user below to filter visual representations dynamically:")
+ipydisplay(user_filter_w)
+
+
+
+
+
+
+
+# Read current choice from the dynamic user widget in Cell 2
+v_user = user_filter_w.value
+
+# Slice in-memory cached logs instantly 
+final_dashboard_df = base_filtered_df.filter((F.col("UserIdentity") == v_user) | (F.lit(v_user) == "All")) \
+                                     .orderBy(F.col("SubmitTime").desc())
+
+print(f"Displaying Interactive Workspace Log Framework For User: {v_user}")
+display(final_dashboard_df)
+
+
+
+
+
+
+
+import time
+
+# 1. EXTRACT RUNNING EXECUTORS AND COMPUTE CAPACITY
+total_nodes = len(sc._jsc.sc().statusTracker().getExecutorInfos())
+core_count_per_node = int(spark.conf.get("spark.executor.cores", "4")) 
+
+# 2. TRACK UPTIME BOUNDS
+uptime_ms = sc._jsc.sc().startTime()
+current_ms = int(round(time.time() * 1000))
+duration_hours = float(current_ms - uptime_ms) / (1000.0 * 60.0 * 60.0)
+
+# 3. CALCULATE vCPU METRIC COSTS ($0.17 per vCPU Hour standard azure billing rate)
+total_vcpu_hours = total_nodes * core_count_per_node * duration_hours
+azure_spark_rate_per_vcpu_hour = 0.1700
+estimated_spark_cost_usd = total_vcpu_hours * azure_spark_rate_per_vcpu_hour
+
+# 4. TABULATE METRIC DISPLAY TILE
+spark_summary_data = [(
+    total_nodes, 
+    f"{core_count_per_node} vCPUs", 
+    f"{round(duration_hours * 60, 1)} Minutes", 
+    round(total_vcpu_hours, 3), 
+    f"${round(estimated_spark_cost_usd, 4)}"
+)]
+
+spark_summary_schema = ["Total Active Nodes", "Node Compute Size", "Notebook Active Uptime", "Total vCPU Hours", "Estimated Cluster Cost (USD)"]
+spark_cost_df = spark.createDataFrame(spark_summary_data, spark_summary_schema)
+
+print("--- Current Spark Cluster Infrastructure Billing Metrics ---")
+display(spark_cost_df)
+
+
+
+
