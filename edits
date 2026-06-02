@@ -1,138 +1,14 @@
-from pyspark.sql import functions as F
-from pyspark.sql.types import *
-
 # -------------------------------------------------------------------------
-# 1. SETUP ALL 10 POOL NAMES IN THE DROPDOWN WIDGETS
+# 1. SETUP ALL 10 POOL NAMES IN THE SYNAPSE DROPDOWN WIDGETS
 # -------------------------------------------------------------------------
-# Add all your explicit pool names to the array list below
 pool_names_list = ["All", "finance_dw", "risk_dw", "marketing_dw", "operations_dw", "hr_dw", "Built-in"]
 
-dbutils.widgets.dropdown("PoolTypeFilter", "All", ["All", "Dedicated", "Serverless"])
-dbutils.widgets.dropdown("PoolNameFilter", "All", pool_names_list)
-dbutils.widgets.dropdown("TimeFilter", "Past 24 Hours", ["Past 1 Hour", "Past 4 Hours", "Past 24 Hours", "Past 3 Days"])
+# Swapped dbutils to mssparkutils.notebook.widgets
+mssparkutils.notebook.widgets.dropdown("PoolTypeFilter", "All", ["All", "Dedicated", "Serverless"])
+mssparkutils.notebook.widgets.dropdown("PoolNameFilter", "All", pool_names_list)
+mssparkutils.notebook.widgets.dropdown("TimeFilter", "Past 24 Hours", ["Past 1 Hour", "Past 4 Hours", "Past 24 Hours", "Past 3 Days"])
 
 # Read widget parameter choices dynamically
-v_type = dbutils.widgets.get("PoolTypeFilter")
-v_name = dbutils.widgets.get("PoolNameFilter")
-v_time = dbutils.widgets.get("TimeFilter")
-
-# Set time offsets based on selection
-days_lookback = 1; hours_lookback = 0
-if v_time == "Past 1 Hour":   days_lookback = 0; hours_lookback = 1
-elif v_time == "Past 4 Hours": days_lookback = 0; hours_lookback = 4
-elif v_time == "Past 3 Days":  days_lookback = 3; hours_lookback = 0
-
-# -------------------------------------------------------------------------
-# 2. GENERATE TOKEN & DEFINE THE 10 TEAMS LIST MATRIX
-# -------------------------------------------------------------------------
-token = mssparkutils.credentials.getToken("DW")
-synapse_sql_endpoint = "yourworkspace.sql.azuresynapse.net" # Main workspace endpoint
-
-# TODO: Define all 10 of your pools here mapping them to a Team Name tag
-teams_config = [
-    {"team": "Team_Finance", "pool": "finance_dw"},
-    {"team": "Team_Risk", "pool": "risk_dw"},
-    {"team": "Team_Marketing", "pool": "marketing_dw"},
-    {"team": "Team_Operations", "pool": "operations_dw"},
-    {"team": "Team_HR", "pool": "hr_dw"},
-    # ... Add the remaining pools to finish your list of 10
-]
-
-dedicated_dfs = []
-
-# -------------------------------------------------------------------------
-# 3. LOOP AND EXTRACT LOGS FROM ALL ACTIVE DEDICATED POOLS
-# -------------------------------------------------------------------------
-dedicated_dmv_query = f"""
-(
-    SELECT 
-        r.request_id AS ReqId,
-        s.login_name AS UserIdentity,
-        r.submit_time AS SubmitTime,
-        DATEDIFF(second, r.start_time, r.end_time) AS DurationSec,
-        r.command AS QueryText,
-        r.status AS Status
-    FROM sys.dm_pdw_exec_requests r
-    JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
-    WHERE r.start_time >= DATEADD({ 'hour' if hours_lookback > 0 else 'day' }, -{ hours_lookback if hours_lookback > 0 else days_lookback }, GETDATE())
-) AS logs
-"""
-
-for cfg in teams_config:
-    # OPTIMIZATION: If user chose a specific pool in the dropdown, skip querying the other 9 to save memory!
-    if v_name != "All" and v_name != cfg["pool"]:
-        continue
-        
-    jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={cfg['pool']}"
-    print(f"Extracting telemetry from active pool: {cfg['pool']}...")
-    
-    try:
-        tmp_df = spark.read.format("jdbc") \
-            .option("url", jdbc_url) \
-            .option("dbtable", dedicated_dmv_query) \
-            .option("accessToken", token) \
-            .load()
-            
-        # Append database identifying traits
-        tmp_df = tmp_df.withColumn("TeamName", F.lit(cfg["team"])) \
-                       .withColumn("PoolName", F.lit(cfg["pool"])) \
-                       .withColumn("PoolType", F.lit("Dedicated")) \
-                       .withColumn("DataProcessedGB", F.lit(0.0)) \
-                       .withColumn("EstimatedCostUSD", F.lit(0.0))
-        dedicated_dfs.append(tmp_df)
-    except Exception as e:
-        print(f"Skipping database '{cfg['pool']}' - Pool is likely paused right now.")
-
-# Union all target pool dataframes together safely
-if dedicated_dfs:
-    master_dedicated_df = dedicated_dfs[0]
-    for next_df in dedicated_dfs[1:]:
-        master_dedicated_df = master_dedicated_df.unionByName(next_df)
-else:
-    # Empty schema template fallback if no dedicated pools matched or were active
-    schema_dec = StructType([
-        StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
-        StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
-        StructField("QueryText", StringType(), True), StructField("Status", StringType(), True),
-        StructField("PoolType", StringType(), True), StructField("PoolName", StringType(), True),
-        StructField("TeamName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
-        StructField("EstimatedCostUSD", DoubleType(), True)
-    ])
-    master_dedicated_df = spark.createDataFrame([], schema_dec)
-
-# -------------------------------------------------------------------------
-# 4. EXTRACT GLOBAL SERVERLESS LOG INFRASTRUCTURE
-# -------------------------------------------------------------------------
-if v_name == "All" or v_name == "Built-in":
-    print("Extracting Serverless consumption footprint...")
-    try:
-        serverless_raw = spark.read.table("SynapseBuiltinSqlPoolRequestsEnded") \
-            .filter(f"StartTime >= ago({ '1h' if v_time == 'Past 1 Hour' else '4h' if v_time == 'Past 4 Hours' else '1d' if v_time == 'Past 24 Hours' else '3d' })")
-            
-        master_serverless_df = serverless_raw.select(
-            F.col("RequestId").alias("ReqId"),
-            F.col("Identity").alias("UserIdentity"),
-            F.col("StartTime").alias("SubmitTime"),
-            (F.unix_timestamp("EndTime") - F.unix_timestamp("StartTime")).alias("DurationSec"),
-            F.col("QueryText"),
-            F.col("Status")
-        ).withColumn("PoolType", F.lit("Serverless")) \
-         .withColumn("PoolName", F.lit("Built-in")) \
-         .withColumn("TeamName", F.lit("Shared_Serverless")) \
-         .withColumn("DataProcessedGB", F.round(F.col("dataProcessedBytes_d") / (1024*1024*1024), 3)) \
-         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4))
-    except:
-        master_serverless_df = spark.createDataFrame([], master_dedicated_df.schema)
-else:
-    master_serverless_df = spark.createDataFrame([], master_dedicated_df.schema)
-
-# -------------------------------------------------------------------------
-# 5. UNION BOTH POOL TYPES AND APPLY REMAINING DROPDOWN FILTER
-# -------------------------------------------------------------------------
-dashboard_master_df = master_dedicated_df.unionByName(master_serverless_df)
-
-# Handle top level Pool Type filter matching ('All', 'Dedicated', or 'Serverless')
-final_filtered_df = dashboard_master_df.filter((F.col("PoolType") == v_type) | (F.lit(v_type) == "All"))
-
-final_filtered_df.cache()
-print("All 10 pools checked! Ready to update dashboard charts.")
+v_type = mssparkutils.notebook.widgets.get("PoolTypeFilter")
+v_name = mssparkutils.notebook.widgets.get("PoolNameFilter")
+v_time = mssparkutils.notebook.widgets.get("TimeFilter")
