@@ -1,55 +1,44 @@
-SynapseSqlPoolExecRequests
-| take 5
-| project Properties
-
-
 let userFilter = "{UserSearch}";
 let selectedPool = "{PoolType}";
 //
-// 1. Gather Dedicated Pool Telemetry
+// 1. Resolve Dedicated Pool Sessions to true LoginNames
+let dedicatedSessions = 
+    SynapseSqlPoolSqlRequests
+    | summarize hint.strategy=shuffle TakeName = any(LoginName) by SessionId;
+//
+// 2. Gather Dedicated Pool Telemetry
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
     | where selectedPool in ("All", "Dedicated")
-    | extend 
-        LoginName = tostring(Properties.loginName),
-        CommandText = tostring(Properties.command),
-        StatusText = tostring(Properties.status),
-        ReqId = tostring(Properties.requestId),
-        DurationMs = tolong(Properties.durationMs)
-    | where isempty(userFilter) or LoginName has userFilter
+    | join kind=inner dedicatedSessions on SessionId
+    | where isempty(userFilter) or TakeName has userFilter
     | project 
-        RequestId = ReqId,
+        RequestId = RequestId,
         PoolType = "Dedicated",
-        User = LoginName,
-        SubmitTime = TimeGenerated,
-        EndTime = TimeGenerated + totimespan(DurationMs * 10000), // Approximate end time from duration
+        User = TakeName,
+        SubmitTime = SubmitTime,
+        EndTime = EndTime,
         DurationSec = round(DurationMs / 1000.0, 2),
         DataProcessedGB = 0.0, 
-        QueryText = CommandText,
-        Status = StatusText;
+        QueryText = Command,
+        Status = Status;
 //
-// 2. Gather Serverless Pool Telemetry
+// 3. Gather Serverless Pool Telemetry
 let serverlessQueries = 
     SynapseBuiltinSqlPoolRequests
     | where selectedPool in ("All", "Serverless")
-    | extend 
-        LoginName = tostring(Properties.identity),
-        CommandText = tostring(Properties.queryText),
-        StatusText = tostring(Properties.status),
-        ReqId = tostring(Properties.requestId),
-        DurationMs = tolong(Properties.durationMs)
-    | where isempty(userFilter) or LoginName has userFilter
+    | where isempty(userFilter) or Identity has userFilter
     | project 
-        RequestId = ReqId,
+        RequestId = RequestId,
         PoolType = "Serverless",
-        User = LoginName,
-        SubmitTime = TimeGenerated,
-        EndTime = TimeGenerated + totimespan(DurationMs * 10000),
+        User = Identity,
+        SubmitTime = StartTime,
+        EndTime = EndTime,
         DurationSec = round(DurationMs / 1000.0, 2),
         DataProcessedGB = 0.0,
-        QueryText = CommandText,
-        Status = StatusText;
+        QueryText = QueryText,
+        Status = Status;
 //
-// 3. Union and Display Results
+// 4. Combine and Display Results
 union dedicatedQueries, serverlessQueries
 | order by SubmitTime desc
