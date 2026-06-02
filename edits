@@ -131,4 +131,42 @@ else:
     ])
     master_dedicated_df = spark.createDataFrame([], schema_template)
 
-# ----------------
+# -------------------------------------------------------------------------
+# 4. LIVE LOG CAPTURE FOR SHARED SERVERLESS POOL & COSTING
+# -------------------------------------------------------------------------
+if v_name == "All" or v_name == "Built-in (Serverless)":
+    print("Processing Shared Serverless metrics...")
+    try:
+        serverless_lookback = '1h' if v_time == 'Past 1 Hour' else '4h' if v_time == 'Past 4 Hours' else '1d' if v_time == 'Past 24 Hours' else '3d'
+        serverless_raw = spark.read.table("SynapseBuiltinSqlPoolRequestsEnded") \
+            .filter(f"StartTime >= ago({serverless_lookback})")
+            
+        master_serverless_df = serverless_raw.select(
+            F.col("RequestId").alias("ReqId"),
+            F.col("Identity").alias("UserIdentity"),
+            F.col("StartTime").alias("SubmitTime"),
+            (F.unix_timestamp("EndTime") - F.unix_timestamp("StartTime")).alias("DurationSec"),
+            F.col("QueryText"),
+            F.col("Status")
+        ).withColumn("PoolType", F.lit("Serverless")) \
+         .withColumn("PoolName", F.lit("Built-in (Serverless)")) \
+         .withColumn("TeamName", F.lit("Shared Infrastructure")) \
+         .withColumn("DataProcessedGB", F.round(F.col("dataProcessedBytes_d") / (1024*1024*1024), 3)) \
+         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4))
+    except:
+        master_serverless_df = spark.createDataFrame([], master_dedicated_df.schema)
+else:
+    master_serverless_df = spark.createDataFrame([], master_dedicated_df.schema)
+
+# -------------------------------------------------------------------------
+# 5. UNIFY POOLS AND APPLY TARGET DROP-DOWN FILTERS
+# -------------------------------------------------------------------------
+dashboard_master_df = master_dedicated_df.unionByName(master_serverless_df)
+
+# Final clean filtration pass based on user selection matrix
+final_filtered_df = dashboard_master_df.filter((F.col("PoolType") == v_type) | (F.lit(v_type) == "All")) \
+                                       .orderBy(F.col("SubmitTime").desc())
+
+final_filtered_df.cache()
+print("\n--- Dashboard Refresh Complete! ---")
+print(f"Current View Metrics -> Type: {v_type} | Pool: {v_name} | Lookback Window: {v_time}")
