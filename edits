@@ -2,26 +2,22 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import *
 
 # -------------------------------------------------------------------------
-# 1. SETUP INTERACTIVE DROP-DOWNS (WIDGETS) FOR THIS TEAM
+# 1. GENERATE DYNAMIC AUTHENTICATION TOKEN (CURRENT USER / MSI PASSTHROUGH)
 # -------------------------------------------------------------------------
-# This adds interactive filters to the top of your notebook page
-dbutils.widgets.dropdown("PoolTypeFilter", "All", ["All", "Dedicated", "Serverless"])
+# "DW" tells Synapse to fetch a secure token explicitly for Azure Synapse SQL
+token = mssparkutils.credentials.getToken("DW")
 
 # -------------------------------------------------------------------------
-# 2. CONFIGURE TARGET DATABASE (GUINEA PIG: TEAM FINANCE)
+# 2. CONFIGURATION (GUINEA PIG: TEAM FINANCE)
 # -------------------------------------------------------------------------
-# TODO: Replace these placeholders with your exact workspace details
 synapse_sql_endpoint = "yourworkspace.sql.azuresynapse.net" 
 dedicated_db_name = "finance_dw" 
-sql_admin_user = "your_sql_admin_username"
-sql_admin_password = "your_sql_password"
 
 jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={dedicated_db_name}"
 
 # -------------------------------------------------------------------------
-# 3. PULL LIVE DEDICATED DMVs VIA JDBC
+# 3. PULL LIVE DEDICATED DMVs USING THE ACCESS TOKEN
 # -------------------------------------------------------------------------
-# This targets the in-memory engine logs directly inside your dedicated pool
 dedicated_dmv_query = """
 (
     SELECT 
@@ -33,19 +29,19 @@ dedicated_dmv_query = """
         r.status AS Status
     FROM sys.dm_pdw_exec_requests r
     JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
-    WHERE r.start_time >= DATEADD(day, -1, GETDATE()) -- Past 24 hours
+    WHERE r.start_time >= DATEADD(day, -1, GETDATE())
 ) AS logs
 """
 
-print(f"Connecting to Dedicated Pool: {dedicated_db_name}...")
+print(f"Connecting token-free to Dedicated Pool: {dedicated_db_name}...")
+
 dedicated_df = spark.read.format("jdbc") \
     .option("url", jdbc_url) \
     .option("dbtable", dedicated_dmv_query) \
-    .option("user", sql_admin_user) \
-    .option("password", sql_admin_password) \
+    .option("accessToken", token) \
     .load()
 
-# Add unified tracking metadata columns
+# Add metadata tracking tags
 dedicated_df = dedicated_df.withColumn("TeamName", F.lit("Team_Finance")) \
                            .withColumn("PoolName", F.lit(dedicated_db_name)) \
                            .withColumn("PoolType", F.lit("Dedicated")) \
@@ -53,7 +49,7 @@ dedicated_df = dedicated_df.withColumn("TeamName", F.lit("Team_Finance")) \
                            .withColumn("EstimatedCostUSD", F.lit(0.0))
 
 # -------------------------------------------------------------------------
-# 4. PULL NATIVE SERVERLESS LOGS & FILTER FOR FINANCE USERS
+# 4. PULL NATIVE SERVERLESS LOGS
 # -------------------------------------------------------------------------
 print("Pulling Serverless log framework...")
 try:
@@ -72,12 +68,7 @@ try:
      .withColumn("TeamName", F.lit("Team_Finance")) \
      .withColumn("DataProcessedGB", F.round(F.col("dataProcessedBytes_d") / (1024*1024*1024), 3)) \
      .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4))
-     
-    # Optional: Filter serverless logs to match finance user naming patterns if applicable
-    # serverless_df = serverless_df.filter(F.col("UserIdentity").contains("finance"))
-
 except:
-    # Safe structure fallback if serverless environment table has zero metrics recorded
     schema = StructType([
         StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
         StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
@@ -89,15 +80,9 @@ except:
     serverless_df = spark.createDataFrame([], schema)
 
 # -------------------------------------------------------------------------
-# 5. UNION BOTH POOLS & APPLY INTERACTIVE WIDGET FILTERS
+# 5. UNION RESULTS FOR VISUALIZATION
 # -------------------------------------------------------------------------
-master_df = dedicated_df.unionByName(serverless_df)
+master_df = dedicated_df.unionByName(serverless_df).orderBy(F.col("SubmitTime").desc())
+master_df.cache()
 
-# Read the interactive dropdown parameter value selected by the user
-v_type = dbutils.widgets.get("PoolTypeFilter")
-
-# Filter dataset dynamically on the fly based on drop-down selection
-dashboard_df = master_df.filter((F.col("PoolType") == v_type) | (F.lit(v_type) == "All")) \
-                        .orderBy(F.col("SubmitTime").desc())
-
-print("Data successfully loaded and cached!")
+print("Execution complete! Data mapped into master dataframe safely.")
