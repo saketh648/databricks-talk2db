@@ -1,3 +1,39 @@
-Hi Matt! Thanks so much for the appreciation in last week's DPP call. Since we haven't officially connected since I started, I wanted to say a quick hello and share a bit of my background.
-Before this, I spent 3 years at CIBC as a Data Engineer (fully focused on Azure and Databricks) and later worked as a Python dev at an Al startup specializing in Azure Al services.
-I know we're in a really busy stretch with intakes right now, but if any development or Azure-heavy requirements come up down the line where you could use an extra set of hands, please let me or the team know. We'd be happy to jump on an intake and help refine it!
+let userFilter = "{UserSearch}";
+let selectedPool = "{PoolType}";
+//
+// 1. Gather Dedicated Pool Telemetry
+let dedicatedQueries = 
+    SynapseSqlPoolExecRequests
+    | where selectedPool in ("All", "Dedicated")
+    | where isempty(userFilter) or loginName_s has userFilter
+    | project 
+        RequestId = requestId_s,
+        PoolType = "Dedicated",
+        User = loginName_s,
+        SubmitTime = startTime_t,
+        EndTime = endTime_t,
+        DurationSec = round(durationMs_d / 1000.0, 2),
+        DataProcessedGB = 0.0, 
+        QueryText = command_s,
+        Status = status_s;
+//
+// 2. Gather Serverless Pool Telemetry
+let serverlessQueries = 
+    SynapseBuiltinSqlPoolRequests
+    | where selectedPool in ("All", "Serverless")
+    | where isempty(userFilter) or identity_s has userFilter
+    | project 
+        RequestId = requestId_s,
+        PoolType = "Serverless",
+        User = identity_s,
+        SubmitTime = startTime_t,
+        EndTime = endTime_t,
+        DurationSec = round(durationMs_d / 1000.0, 2),
+        -- If dataProcessedBytes_d isn't in this specific table, you can substitute 0.0
+        DataProcessedGB = round(dataProcessedBytes_d / (1024.0 * 1024.0 * 1024.0), 3),
+        QueryText = queryText_s,
+        Status = status_s;
+//
+// 3. Union and Display Results
+union dedicatedQueries, serverlessQueries
+| order by SubmitTime desc
