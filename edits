@@ -1,13 +1,3 @@
-AzureDiagnostics
-| where ResourceProvider == "MICROSOFT.SYNAPSE"
-| where Category == "SynapseDedicatedSqlPoolExecRequests"
-| take 10
-| project 
-    TimeGenerated, 
-    LogicalServerName_s, 
-    DatabaseName_s, 
-    requestId_s, 
-    loginName_s, 
-    status_s, 
-    durationMs_d, 
-    command_s
+Hi Matt! Thanks so much for the appreciation in last week's DPP call. Since we haven't officially connected since I started, I wanted to say a quick hello and share a bit of my background.
+Before this, I spent 3 years at CIBC as a Data Engineer (fully focused on Azure and Databricks) and later worked as a Python dev at an Al startup specializing in Azure Al services.
+I know we're in a really busy stretch with intakes right now, but if any development or Azure-heavy requirements come up down the line where you could use an extra set of hands, please let me or the team know. We'd be happy to jump on an intake and help refine it!
