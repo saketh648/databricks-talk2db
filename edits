@@ -1,7 +1,7 @@
 let userFilter = "{UserSearch}";
 let selectedPool = "{PoolType}";
 //
-// 1. Resolve Dedicated Pool Sessions to true LoginNames
+// 1. Resolve Dedicated Pool Sessions to true LoginNames using the exact case-sensitive schemas
 let dedicatedSessions = 
     SynapseSqlPoolSqlRequests
     | summarize hint.strategy=shuffle TakeName = any(LoginName) by SessionId;
@@ -18,7 +18,7 @@ let dedicatedQueries =
         User = TakeName,
         SubmitTime = SubmitTime,
         EndTime = EndTime,
-        DurationSec = round(DurationMs / 1000.0, 2),
+        DurationSec = datetime_diff('second', EndTime, StartTime),
         DataProcessedGB = 0.0, 
         QueryText = Command,
         Status = Status;
@@ -34,7 +34,7 @@ let serverlessQueries =
         User = Identity,
         SubmitTime = StartTime,
         EndTime = EndTime,
-        DurationSec = round(DurationMs / 1000.0, 2),
+        DurationSec = datetime_diff('second', EndTime, StartTime),
         DataProcessedGB = 0.0,
         QueryText = QueryText,
         Status = Status;
