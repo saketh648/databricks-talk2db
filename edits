@@ -1,21 +1,15 @@
 let userFilter = "{UserSearch}";
 let selectedPool = "{PoolType}";
 //
-// 1. Resolve Dedicated Pool Sessions to true LoginNames using the exact case-sensitive schemas
-let dedicatedSessions = 
-    SynapseSqlPoolSqlRequests
-    | summarize hint.strategy=shuffle TakeName = any(LoginName) by SessionId;
-//
-// 2. Gather Dedicated Pool Telemetry
+// 1. Gather Dedicated Pool Telemetry using only columns verified in your screenshots
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
     | where selectedPool in ("All", "Dedicated")
-    | join kind=inner dedicatedSessions on SessionId
-    | where isempty(userFilter) or TakeName has userFilter
+    | where isempty(userFilter) or ClientCorrelationId has userFilter or Command has userFilter
     | project 
         RequestId = RequestId,
         PoolType = "Dedicated",
-        User = TakeName,
+        User = iff(isnotempty(ClientCorrelationId), ClientCorrelationId, "System/Service"),
         SubmitTime = SubmitTime,
         EndTime = EndTime,
         DurationSec = datetime_diff('second', EndTime, StartTime),
@@ -23,11 +17,11 @@ let dedicatedQueries =
         QueryText = Command,
         Status = Status;
 //
-// 3. Gather Serverless Pool Telemetry
+// 2. Gather Serverless Pool Telemetry 
 let serverlessQueries = 
     SynapseBuiltinSqlPoolRequests
     | where selectedPool in ("All", "Serverless")
-    | where isempty(userFilter) or Identity has userFilter
+    | where isempty(userFilter) or Identity has userFilter or QueryText has userFilter
     | project 
         RequestId = RequestId,
         PoolType = "Serverless",
@@ -39,6 +33,6 @@ let serverlessQueries =
         QueryText = QueryText,
         Status = Status;
 //
-// 4. Combine and Display Results
+// 3. Combine and Display Results
 union dedicatedQueries, serverlessQueries
 | order by SubmitTime desc
