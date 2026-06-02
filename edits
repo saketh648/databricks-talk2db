@@ -5,17 +5,17 @@ let selectedPool = "{PoolType}";
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
     | where selectedPool in ("All", "Dedicated")
-    | where isempty(userFilter) or loginName_s has userFilter
+    | where isempty(userFilter) or LoginName has userFilter
     | project 
-        RequestId = requestId_s,
+        RequestId = RequestId,
         PoolType = "Dedicated",
-        User = loginName_s,
-        SubmitTime = startTime_t,
-        EndTime = endTime_t,
-        DurationSec = round(durationMs_d / 1000.0, 2),
+        User = LoginName,
+        SubmitTime = SubmitTime,
+        EndTime = EndTime,
+        DurationSec = round(DurationMs / 1000.0, 2),
         DataProcessedGB = 0.0, 
-        QueryText = command_s,
-        Status = status_s;
+        QueryText = Command,
+        Status = Status;
 //
 // 2. Gather Serverless Pool Telemetry
 let serverlessQueries = 
@@ -29,7 +29,7 @@ let serverlessQueries =
         SubmitTime = startTime_t,
         EndTime = endTime_t,
         DurationSec = round(durationMs_d / 1000.0, 2),
-        DataProcessedGB = 0.0, // Fixed the parsing break here by using a static numeric format
+        DataProcessedGB = 0.0,
         QueryText = queryText_s,
         Status = status_s;
 //
