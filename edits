@@ -1,14 +1,134 @@
-# -------------------------------------------------------------------------
-# 1. SETUP ALL 10 POOL NAMES IN THE SYNAPSE DROPDOWN WIDGETS
-# -------------------------------------------------------------------------
-pool_names_list = ["All", "finance_dw", "risk_dw", "marketing_dw", "operations_dw", "hr_dw", "Built-in"]
+import ipywidgets as widgets
+from IPython.display import display as ipydisplay
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
 
-# Swapped dbutils to mssparkutils.notebook.widgets
-mssparkutils.notebook.widgets.dropdown("PoolTypeFilter", "All", ["All", "Dedicated", "Serverless"])
-mssparkutils.notebook.widgets.dropdown("PoolNameFilter", "All", pool_names_list)
-mssparkutils.notebook.widgets.dropdown("TimeFilter", "Past 24 Hours", ["Past 1 Hour", "Past 4 Hours", "Past 24 Hours", "Past 3 Days"])
+# -------------------------------------------------------------------------
+# 1. NATIVE SYNAPSE DROPDOWN WIDGETS
+# -------------------------------------------------------------------------
+# Consolidated list of your 15 explicit Dedicated Pools + Serverless
+pool_names_list = [
+    "All",
+    "Care_dev_dedicated",
+    "ac_operations__dev_dedicated_new",
+    "wcib_dev_dedicated",
+    "operations_and_enterprise_prod_dedicated",
+    "marketing_data_products_prod_dedicated",
+    "marketing_activation_dev_dedicated",
+    "special_projects__dev_dedicated",
+    "operations_and_enterprise_dev_dedicated",
+    "marketing_analytics__prod_dedicated",
+    "care_prod_dedicated",
+    "digital_prod_dedicated",
+    "marketing_analytics_dev_dedicated",
+    "digital_dev_dedicated",
+    "locations_analytics_prod_dedicated",
+    "wcib_prod_dedicated",
+    "Built-in (Serverless)"
+]
 
-# Read widget parameter choices dynamically
-v_type = mssparkutils.notebook.widgets.get("PoolTypeFilter")
-v_name = mssparkutils.notebook.widgets.get("PoolNameFilter")
-v_time = mssparkutils.notebook.widgets.get("TimeFilter")
+pool_type_w = widgets.Dropdown(options=["All", "Dedicated", "Serverless"], value="All", description="Pool Type:")
+pool_name_w = widgets.Dropdown(options=pool_names_list, value="All", description="Pool Name:")
+time_filter_w = widgets.Dropdown(options=["Past 1 Hour", "Past 4 Hours", "Past 24 Hours", "Past 3 Days"], value="Past 24 Hours", description="Time Range:")
+
+# Render the drop-down selectors on screen
+ipydisplay(pool_type_w, pool_name_w, time_filter_w)
+
+# Capture active selections
+v_type = pool_type_w.value
+v_name = pool_name_w.value
+v_time = time_filter_w.value
+
+# Calculate time offsets based on choice
+days_lookback = 1; hours_lookback = 0
+if v_time == "Past 1 Hour":   days_lookback = 0; hours_lookback = 1
+elif v_time == "Past 4 Hours": days_lookback = 0; hours_lookback = 4
+elif v_time == "Past 3 Days":  days_lookback = 3; hours_lookback = 0
+
+# -------------------------------------------------------------------------
+# 2. ENTRA PASSTHROUGH TOKEN & WORKSPACE ENVIRONMENT SETUP
+# -------------------------------------------------------------------------
+token = mssparkutils.credentials.getToken("DW")
+synapse_sql_endpoint = "yourworkspace.sql.azuresynapse.net" # TODO: Update with your workspace prefix
+
+# Map your pools to organizational Team names for unified dashboard views
+teams_config = [
+    {"team": "Care Team", "pool": "Care_dev_dedicated"},
+    {"team": "Operations Team", "pool": "ac_operations__dev_dedicated_new"},
+    {"team": "WCIB Corporate Team", "pool": "wcib_dev_dedicated"},
+    {"team": "Operations Team", "pool": "operations_and_enterprise_prod_dedicated"},
+    {"team": "Marketing Data Team", "pool": "marketing_data_products_prod_dedicated"},
+    {"team": "Marketing Act Team", "pool": "marketing_activation_dev_dedicated"},
+    {"team": "Special Projects Team", "pool": "special_projects__dev_dedicated"},
+    {"team": "Operations Team", "pool": "operations_and_enterprise_dev_dedicated"},
+    {"team": "Marketing Analyt Team", "pool": "marketing_analytics__prod_dedicated"},
+    {"team": "Care Team", "pool": "care_prod_dedicated"},
+    {"team": "Digital Product Team", "pool": "digital_prod_dedicated"},
+    {"team": "Marketing Analyt Team", "pool": "marketing_analytics_dev_dedicated"},
+    {"team": "Digital Product Team", "pool": "digital_dev_dedicated"},
+    {"team": "Location Analyt Team", "pool": "locations_analytics_prod_dedicated"},
+    {"team": "WCIB Corporate Team", "pool": "wcib_prod_dedicated"}
+]
+
+dedicated_dfs = []
+
+# -------------------------------------------------------------------------
+# 3. LIVE QUERY EXTRACTION FOR DEDICATED POOLS (VIA JDBC PASS-THROUGH)
+# -------------------------------------------------------------------------
+dedicated_dmv_query = f"""
+(
+    SELECT 
+        r.request_id AS ReqId,
+        s.login_name AS UserIdentity,
+        r.submit_time AS SubmitTime,
+        DATEDIFF(second, r.start_time, r.end_time) AS DurationSec,
+        r.command AS QueryText,
+        r.status AS Status
+    FROM sys.dm_pdw_exec_requests r
+    JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
+    WHERE r.start_time >= DATEADD({ 'hour' if hours_lookback > 0 else 'day' }, -{ hours_lookback if hours_lookback > 0 else days_lookback }, GETDATE())
+) AS logs
+"""
+
+for cfg in teams_config:
+    # OPTIMIZATION: Bypass querying the other 14 pools if a single pool is isolated in the dropdown
+    if v_name != "All" and v_name != cfg["pool"]:
+        continue
+        
+    jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={cfg['pool']}"
+    print(f"Polling DMV Telemetry: {cfg['pool']}...")
+    
+    try:
+        tmp_df = spark.read.format("jdbc") \
+            .option("url", jdbc_url) \
+            .option("dbtable", dedicated_dmv_query) \
+            .option("accessToken", token) \
+            .load()
+            
+        # Standardize table layout tags
+        tmp_df = tmp_df.withColumn("TeamName", F.lit(cfg["team"])) \
+                       .withColumn("PoolName", F.lit(cfg["pool"])) \
+                       .withColumn("PoolType", F.lit("Dedicated")) \
+                       .withColumn("DataProcessedGB", F.lit(0.0)) \
+                       .withColumn("EstimatedCostUSD", F.lit(0.0))
+        dedicated_dfs.append(tmp_df)
+    except Exception as e:
+        print(f"Skipping '{cfg['pool']}' - Pool is offline or paused.")
+
+# Union all active dedicated datasets safely
+if dedicated_dfs:
+    master_dedicated_df = dedicated_dfs[0]
+    for next_df in dedicated_dfs[1:]:
+        master_dedicated_df = master_dedicated_df.unionByName(next_df)
+else:
+    schema_template = StructType([
+        StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
+        StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
+        StructField("QueryText", StringType(), True), StructField("Status", StringType(), True),
+        StructField("PoolType", StringType(), True), StructField("PoolName", StringType(), True),
+        StructField("TeamName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
+        StructField("EstimatedCostUSD", DoubleType(), True)
+    ])
+    master_dedicated_df = spark.createDataFrame([], schema_template)
+
+# ----------------
