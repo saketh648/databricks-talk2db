@@ -1,18 +1,19 @@
-// 1. Map Dedicated Session IDs to their true Human Login Identities
+// 1. Map Dedicated Session IDs to their true Human Login Identities safely
 let dedicatedUserMap = 
     SynapseSqlPoolSqlRequests
-    | where isnotempty(LoginName)
-    | summarize TakeUser = any(LoginName) by SessionId;
+    | extend JoinSessionId = tostring(column_ifexists("SessionId", column_ifexists("Sessionid", column_ifexists("session_id", ""))))
+    | where isnotempty(JoinSessionId) and isnotempty(LoginName)
+    | summarize TakeUser = any(LoginName) by JoinSessionId;
 //
 // 2. Gather Dedicated Pool Telemetry linked to the User Map
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
+    | extend CurrentSessionId = tostring(column_ifexists("SessionId", ""))
     | where TimeGenerated >= ago(24h)
-    | join kind=leftouter dedicatedUserMap on SessionId
+    | join kind=leftouter dedicatedUserMap on $left.CurrentSessionId == $right.JoinSessionId
     | project 
         ReqId = tostring(column_ifexists("RequestId", "")),
         PoolType = "Dedicated",
-        -- If the join finds a user identity, use it; otherwise fallback to the system client app name
         User = iff(isnotempty(TakeUser), TakeUser, iff(isnotempty(ClientCorrelationId), ClientCorrelationId, "System/Service")),
         SubmitTime = SubmitTime,
         EndTime = EndTime,
