@@ -1,3 +1,8 @@
+SynapseSqlPoolExecRequests
+| take 5
+| project Properties
+
+
 let userFilter = "{UserSearch}";
 let selectedPool = "{PoolType}";
 //
@@ -5,33 +10,45 @@ let selectedPool = "{PoolType}";
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
     | where selectedPool in ("All", "Dedicated")
+    | extend 
+        LoginName = tostring(Properties.loginName),
+        CommandText = tostring(Properties.command),
+        StatusText = tostring(Properties.status),
+        ReqId = tostring(Properties.requestId),
+        DurationMs = tolong(Properties.durationMs)
     | where isempty(userFilter) or LoginName has userFilter
     | project 
-        RequestId = RequestId,
+        RequestId = ReqId,
         PoolType = "Dedicated",
         User = LoginName,
-        SubmitTime = SubmitTime,
-        EndTime = EndTime,
+        SubmitTime = TimeGenerated,
+        EndTime = TimeGenerated + totimespan(DurationMs * 10000), // Approximate end time from duration
         DurationSec = round(DurationMs / 1000.0, 2),
         DataProcessedGB = 0.0, 
-        QueryText = Command,
-        Status = Status;
+        QueryText = CommandText,
+        Status = StatusText;
 //
 // 2. Gather Serverless Pool Telemetry
 let serverlessQueries = 
     SynapseBuiltinSqlPoolRequests
     | where selectedPool in ("All", "Serverless")
-    | where isempty(userFilter) or identity_s has userFilter
+    | extend 
+        LoginName = tostring(Properties.identity),
+        CommandText = tostring(Properties.queryText),
+        StatusText = tostring(Properties.status),
+        ReqId = tostring(Properties.requestId),
+        DurationMs = tolong(Properties.durationMs)
+    | where isempty(userFilter) or LoginName has userFilter
     | project 
-        RequestId = requestId_s,
+        RequestId = ReqId,
         PoolType = "Serverless",
-        User = identity_s,
-        SubmitTime = startTime_t,
-        EndTime = endTime_t,
-        DurationSec = round(durationMs_d / 1000.0, 2),
+        User = LoginName,
+        SubmitTime = TimeGenerated,
+        EndTime = TimeGenerated + totimespan(DurationMs * 10000),
+        DurationSec = round(DurationMs / 1000.0, 2),
         DataProcessedGB = 0.0,
-        QueryText = queryText_s,
-        Status = status_s;
+        QueryText = CommandText,
+        Status = StatusText;
 //
 // 3. Union and Display Results
 union dedicatedQueries, serverlessQueries
