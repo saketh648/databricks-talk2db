@@ -1,32 +1,24 @@
-// 1. Map Dedicated Session IDs to their true Human Login Identities safely
-let dedicatedUserMap = 
-    SynapseSqlPoolSqlRequests
-    | extend JoinSessionId = tostring(column_ifexists("SessionId", column_ifexists("Sessionid", column_ifexists("session_id", ""))))
-    | where isnotempty(JoinSessionId) and isnotempty(LoginName)
-    | summarize TakeUser = any(LoginName) by JoinSessionId;
-//
-// 2. Gather Dedicated Pool Telemetry linked to the User Map
+// 1. Gather Dedicated Pool Telemetry (Using ONLY verified snapshot columns)
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
-    | extend CurrentSessionId = tostring(column_ifexists("SessionId", ""))
     | where TimeGenerated >= ago(24h)
-    | join kind=leftouter dedicatedUserMap on $left.CurrentSessionId == $right.JoinSessionId
+    | extend CleanUser = tostring(split(ClientCorrelationId, "_")[0])
     | project 
-        ReqId = tostring(column_ifexists("RequestId", "")),
+        ReqId = RequestId,
         PoolType = "Dedicated",
-        User = iff(isnotempty(TakeUser), TakeUser, iff(isnotempty(ClientCorrelationId), ClientCorrelationId, "System/Service")),
-        SubmitTime = SubmitTime,
+        User = iff(isnotempty(CleanUser), CleanUser, "System/Service"),
+        SubmitTime = StartTime,
         EndTime = EndTime,
         DurationSec = datetime_diff('second', EndTime, StartTime),
         QueryText = Command,
         Status = Status;
 //
-// 3. Gather Serverless Pool Telemetry
+// 2. Gather Serverless Pool Telemetry (Protected with safe fallbacks)
 let serverlessQueries = 
     SynapseBuiltinSqlPoolRequestsEnded
     | where TimeGenerated >= ago(24h)
     | project 
-        ReqId = tostring(column_ifexists("RequestId", column_ifexists("requestId", column_ifexists("requestId_s", "")))),
+        ReqId = tostring(column_ifexists("RequestId", column_ifexists("requestId", ""))),
         PoolType = "Serverless",
         User = tostring(column_ifexists("Identity", column_ifexists("identity_s", "System/Service"))),
         SubmitTime = todatetime(column_ifexists("StartTime", column_ifexists("startTime_t", TimeGenerated))),
@@ -35,9 +27,9 @@ let serverlessQueries =
             todatetime(column_ifexists("EndTime", TimeGenerated)), 
             todatetime(column_ifexists("StartTime", TimeGenerated))
         ),
-        QueryText = tostring(column_ifexists("QueryText", column_ifexists("queryText_s", "Internal Command"))),
+        QueryText = tostring(column_ifexists("QueryText", column_ifexists("queryText_s", "Internal Query"))),
         Status = tostring(column_ifexists("Status", column_ifexists("status_s", "Completed")));
 //
-// 4. Combine and Display Results
+// 3. Combine and Display Results
 union dedicatedQueries, serverlessQueries
 | order by SubmitTime desc
