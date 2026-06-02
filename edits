@@ -1,9 +1,10 @@
+
 // 1. Gather Dedicated Pool Telemetry
 let dedicatedQueries = 
     SynapseSqlPoolExecRequests
     | where TimeGenerated >= ago(24h)
     | project 
-        RequestId = RequestId,
+        ReqId = tostring(column_ifexists("RequestId", "")),
         PoolType = "Dedicated",
         User = iff(isnotempty(ClientCorrelationId), ClientCorrelationId, "System/Service"),
         SubmitTime = SubmitTime,
@@ -12,19 +13,22 @@ let dedicatedQueries =
         QueryText = Command,
         Status = Status;
 //
-// 2. Gather Serverless Pool Telemetry 
+// 2. Gather Serverless Pool Telemetry (Using full safe column-sniffing fallbacks)
 let serverlessQueries = 
     SynapseBuiltinSqlPoolRequestsEnded
     | where TimeGenerated >= ago(24h)
     | project 
-        RequestId = RequestId,
+        ReqId = tostring(column_ifexists("RequestId", column_ifexists("requestId", column_ifexists("requestId_s", "")))),
         PoolType = "Serverless",
-        User = Identity,
-        SubmitTime = StartTime,
-        EndTime = EndTime,
-        DurationSec = datetime_diff('second', EndTime, StartTime),
-        QueryText = QueryText,
-        Status = Status;
+        User = tostring(column_ifexists("Identity", column_ifexists("identity_s", "System/Service"))),
+        SubmitTime = todatetime(column_ifexists("StartTime", column_ifexists("startTime_t", TimeGenerated))),
+        EndTime = todatetime(column_ifexists("EndTime", column_ifexists("endTime_t", TimeGenerated))),
+        DurationSec = datetime_diff('second', 
+            todatetime(column_ifexists("EndTime", TimeGenerated)), 
+            todatetime(column_ifexists("StartTime", TimeGenerated))
+        ),
+        QueryText = tostring(column_ifexists("QueryText", column_ifexists("queryText_s", "Internal Command"))),
+        Status = tostring(column_ifexists("Status", column_ifexists("status_s", "Completed")));
 //
 // 3. Combine and Display Results
 union dedicatedQueries, serverlessQueries
