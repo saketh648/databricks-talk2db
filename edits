@@ -1,3 +1,31 @@
-SynapseSqlPoolExecRequests
-| take 50
-| project RequestId, Command, Status, TimeGenerated
+// 1. Gather Dedicated Pool Telemetry
+let dedicatedQueries = 
+    SynapseSqlPoolExecRequests
+    | where TimeGenerated >= ago(24h)
+    | project 
+        RequestId = RequestId,
+        PoolType = "Dedicated",
+        User = iff(isnotempty(ClientCorrelationId), ClientCorrelationId, "System/Service"),
+        SubmitTime = SubmitTime,
+        EndTime = EndTime,
+        DurationSec = datetime_diff('second', EndTime, StartTime),
+        QueryText = Command,
+        Status = Status;
+//
+// 2. Gather Serverless Pool Telemetry 
+let serverlessQueries = 
+    SynapseBuiltinSqlPoolRequestsEnded
+    | where TimeGenerated >= ago(24h)
+    | project 
+        RequestId = RequestId,
+        PoolType = "Serverless",
+        User = Identity,
+        SubmitTime = StartTime,
+        EndTime = EndTime,
+        DurationSec = datetime_diff('second', EndTime, StartTime),
+        QueryText = QueryText,
+        Status = Status;
+//
+// 3. Combine and Display Results
+union dedicatedQueries, serverlessQueries
+| order by SubmitTime desc
