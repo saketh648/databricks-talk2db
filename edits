@@ -1,9 +1,8 @@
-# 4. SERVERLESS LOG EXTRACTION (EXPLICIT PT1H.JSON FILE TARGET)
+# 4. SERVERLESS LOG EXTRACTION (FLAT SCHEMA MAP CORRECTION)
 master_serverless_df = spark.createDataFrame([], schema_template)
 if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
     print(" -> Direct-Crawling Explicit Storage Paths for Built-in Serverless...")
     try:
-        # FIXED: Replaced * .json with explicit hour/minute folder wildcards leading directly to PT1H.json
         base_storage_path = (
             "abfss://insights-logs-builtinsqlreqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net"
             "/resourceId=/SUBSCRIPTIONS/0A03E58F-29BD-4793-988F-F25C58CC7E1E"
@@ -13,18 +12,18 @@ if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.l
             "/y=*/m=*/d=*/h=*/m=*/PT1H.json"
         )
         
-        # Read the time-partitioned JSON files natively
         raw_storage_df = spark.read.json(base_storage_path)
         
-        # Extract and format properties to match our master dashboard schema
+        # FIXED: Removed 'properties.' prefix and mapped fields directly based on your error log
         master_serverless_df = raw_storage_df.select(
-            F.col("properties.requestId").alias("ReqId"),
-            F.col("properties.identity").alias("UserIdentity"),
-            F.col("properties.startTime").alias("SubmitTime").cast(TimestampType()),
-            (F.unix_timestamp("properties.endTime") - F.unix_timestamp("properties.startTime")).alias("DurationSec"),
-            F.col("properties.queryText").alias("QueryText"),
-            F.col("properties.status").alias("Status"),
-            F.col("properties.dataProcessedBytes").cast(LongType()).alias("Bytes")
+            F.col("clientRequestId").alias("ReqId"),
+            # Note: If 'identity' isn't in your field list, we substitute an 'Unknown' literal or try to fallback
+            (F.col("identity") if "identity" in raw_storage_df.columns else F.lit("System/Unknown")).alias("UserIdentity"),
+            F.col("startTime").cast(TimestampType()).alias("SubmitTime"),
+            (F.unix_timestamp("endTime") - F.unix_timestamp("startTime")).alias("DurationSec"),
+            F.col("queryText").alias("QueryText"),
+            F.col("status").alias("Status"),
+            F.col("dataProcessedBytes").cast(LongType()).alias("Bytes")
         ).withColumn("PoolType", F.lit("Serverless"))\
          .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
          .withColumn("TeamName", F.lit("Shared Infrastructure"))\
@@ -33,4 +32,4 @@ if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.l
          .drop("Bytes")
          
     except Exception as e:
-        print(f"    [Note] No storage logs compiled for this timeframe yet or access restricted: {str(e)}")
+        print(f"    [Note] Schema transformation error: {str(e)}")
