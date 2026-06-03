@@ -1,4 +1,4 @@
-# 4. SERVERLESS LOG EXTRACTION (FINAL VERIFIED SCHEMA PATTERN)
+# 4. SERVERLESS LOG EXTRACTION (EXPLICIT RE-MAP FOR COMMAND AND STATUS)
 master_serverless_df = spark.createDataFrame([], schema_template)
 if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
     print(" -> Direct-Crawling Explicit Storage Paths for Built-in Serverless...")
@@ -14,14 +14,15 @@ if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.l
         
         raw_storage_df = spark.read.json(base_storage_path)
         
-        # FINAL CORRECTION: Mapping based on your exact schema definition rules
+        # FIXED: Mapped to properties.command and derived Status from the error block
         master_serverless_df = raw_storage_df.select(
             F.col("properties.clientRequestId").alias("ReqId"),
-            F.col("identity").alias("UserIdentity"), # Pulled from flat root
+            F.col("identity").alias("UserIdentity"),
             F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
             (F.unix_timestamp("properties.endTime") - F.unix_timestamp("properties.startTime")).alias("DurationSec"),
-            F.col("properties.queryText").alias("QueryText"),
-            F.col("properties.status").alias("Status"),
+            F.col("properties.command").alias("QueryText"),
+            # Derive status: If the 'error' struct is not null, mark it Failed, otherwise Completed
+            F.when(F.col("properties.error").isNotNull(), F.lit("Failed")).otherwise(F.lit("Completed")).alias("Status"),
             F.col("properties.dataProcessedBytes").cast(LongType()).alias("Bytes")
         ).withColumn("PoolType", F.lit("Serverless"))\
          .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
