@@ -1,34 +1,52 @@
-# 4. SERVERLESS LOG EXTRACTION (STRUCT EXTRACTION PATCH)
-master_serverless_df = spark.createDataFrame([], schema_template)
-if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
-    print(" -> Direct-Crawling Explicit Storage Paths for Built-in Serverless...")
-    try:
-        base_storage_path = (
-            "abfss://insights-logs-builtinsqlreqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net"
-            "/resourceId=/SUBSCRIPTIONS/0A03E58F-29BD-4793-988F-F25C58CC7E1E"
-            "/RESOURCEGROUPS/RG-CUS-SYNPEACX-PROD-01"
-            "/PROVIDERS/MICROSOFT.SYNAPSE"
-            "/WORKSPACES/SYNW-SYNPEACX"
-            "/y=*/m=*/d=*/h=*/m=*/PT1H.json"
-        )
-        
-        raw_storage_df = spark.read.json(base_storage_path)
-        
-        # FIXED: Drilled into the identity struct using dot notation (.loginName)
-        master_serverless_df = raw_storage_df.select(
-            F.col("properties.clientRequestId").alias("ReqId"),
-            F.col("identity.loginName").alias("UserIdentity"), # Extracting string from struct
-            F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
-            (F.unix_timestamp("properties.endTime") - F.unix_timestamp("properties.startTime")).alias("DurationSec"),
-            F.col("properties.command").alias("QueryText"),
-            F.when(F.col("properties.error").isNotNull(), F.lit("Failed")).otherwise(F.lit("Completed")).alias("Status"),
-            F.col("properties.dataProcessedBytes").cast(LongType()).alias("Bytes")
-        ).withColumn("PoolType", F.lit("Serverless"))\
-         .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
-         .withColumn("TeamName", F.lit("Shared Infrastructure"))\
-         .withColumn("DataProcessedGB", F.round(F.col("Bytes") / (1024.0*1024.0*1024.0), 3))\
-         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4)) \
-         .drop("Bytes")
-         
-    except Exception as e:
-        print(f"    [Note] Schema transformation error: {str(e)}")
+# -------------------------------------------------------------------------
+# CELL 3: ADAPTIVE CANVAS WITH AUTOMATIC ENGINE SEPARATION
+# -------------------------------------------------------------------------
+v_user = user_filter_w.value
+
+# 1. Fast slice the cached logs in memory
+final_dashboard_df = base_filtered_df.filter((F.col("UserIdentity") == v_user) | (F.lit(v_user) == "All")) \
+                                     .orderBy(F.col("SubmitTime").desc())
+
+# 2. Compute underlying metrics
+total_queries = final_dashboard_df.count()
+avg_execution_time = final_dashboard_df.select(F.avg("DurationSec")).collect()[0][0] or 0.0
+
+# Check if we are currently looking at Serverless data or Dedicated data
+is_serverless_scope = final_dashboard_df.filter(F.col("PoolType") == "Serverless").count() > 0
+is_dedicated_scope = final_dashboard_df.filter(F.col("PoolType") == "Dedicated").count() > 0
+
+print("=" * 85)
+print(f"                     📊 INTERACTIVE ANALYSIS FOR: {v_user.upper()} ")
+print("=" * 85)
+print(f"   🔹 Total Active Queries Run in Window : {total_queries}")
+print(f"   ⏱️ Average Transaction Run Speed     : {round(avg_execution_time, 2)} Seconds")
+
+# 3. SEPARATED PERFORMANCE & COST DISCOVERY CARDS
+if is_serverless_scope and not is_dedicated_scope:
+    # Pure Serverless Cost Tracking Mode
+    total_serverless_cost = final_dashboard_df.select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
+    total_data_scanned = final_dashboard_df.select(F.sum("DataProcessedGB")).collect()[0][0] or 0.0
+    print(f"   💾 Total Data Lake Storage Scanned    : {round(total_data_scanned, 3)} GB")
+    print(f"   💸 Accumulated Consumption Cost      : ${round(total_serverless_cost, 4)}")
+    print("-" * 85)
+    print("   💡 NOTE: Serverless is billed per query at $5.00/TB of data scanned from storage.")
+
+elif is_dedicated_scope and not is_serverless_scope:
+    # Pure Dedicated Concurrency Tracking Mode
+    longest_query = final_dashboard_df.select(F.max("DurationSec")).collect()[0][0] or 0.0
+    print(f"   🚀 Peak Single Query Runtime         : {longest_query} Seconds")
+    print("-" * 85)
+    print("   💡 NOTE: Dedicated Pools are billed on flat capacity rates based on DWU block sizing.")
+    print("            Columns 'DataProcessedGB' and 'EstimatedCostUSD' apply exclusively to Serverless.")
+
+else:
+    # Blended/All View Mode
+    total_serverless_cost = final_dashboard_df.filter(F.col("PoolType") == "Serverless").select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
+    print(f"   💸 Total Serverless Segment Cost      : ${round(total_serverless_cost, 4)}")
+    print("-" * 85)
+    print("   💡 TIP: Use the 'Pool Type' dropdown to isolate specific infrastructure pricing tracks.")
+
+print("=" * 85 + "\n")
+
+# 4. OUTPUT GRAPHICAL CANVAS Grid
+display(final_dashboard_df)
