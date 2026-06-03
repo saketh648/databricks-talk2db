@@ -1,8 +1,30 @@
-# Quick test to see if Spark sees any files at all
-test_path = "abfss://insights-logs-builtinsqlreqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net/resourceId=/SUBSCRIPTIONS/0A03E58F-29BD-4793-988F-F25C58CC7E1E/RESOURCEGROUPS/RG-CUS-SYNPEACX-PROD-01/PROVIDERS/MICROSOFT.SYNAPSE/WORKSPACES/SYNW-SYNPEACX/y=2026/m=06/d=03/*/*/*.json"
+# 5. REVISED RESILIENT INFRASTRUCTURE FILTERING
+# If Serverless is selected, we bypass strict pool naming checks since it's the Built-in engine
+if v_type.lower() == "serverless":
+    base_filtered_df = clean_master_df.filter(F.col("PoolType") == "Serverless")
+elif v_type.lower() == "dedicated":
+    base_filtered_df = clean_master_df.filter(F.col("PoolType") == "Dedicated")\
+                                      .filter((F.col("PoolName") == v_name) | (F.lit(v_name) == "All"))
+else:
+    # 'All' View Scope
+    base_filtered_df = clean_master_df.filter(
+        (F.col("PoolName") == v_name) | 
+        (F.lit(v_name) == "All") | 
+        (F.col("PoolType") == "Serverless")
+    )
 
-try:
-    raw_count = spark.read.json(test_path).count()
-    print(f"🔥 Success! Found {raw_count} raw log lines in today's storage folder.")
-except Exception as e:
-    print(f"❌ Storage path read failed: {str(e)}")
+base_filtered_df.cache()
+
+# 6. GENERATE INTERACTIVE DESKTOP DROPDOWNS
+# Extracting clean flat strings from your loaded rows
+unique_users = [row['UserIdentity'] for row in base_filtered_df.select("UserIdentity").distinct().collect() if row['UserIdentity']]
+unique_users.sort()
+unique_users.insert(0, "All")
+
+user_filter_w = widgets.Dropdown(options=unique_users, value="All", description="View User:")
+status_filter_w = widgets.Dropdown(options=["All", "Completed", "Running", "Failed", "Cancelled"], value="All", description="Query Status:")
+type_filter_w = widgets.Dropdown(options=["All", "SELECT (Read)", "DML (Write)", "DDL (Schema)", "System/Procedure"], value="All", description="Command Class:")
+
+print(f"--- SUCCESS: {base_filtered_df.count()} Base Master Records Cached In-Memory! ---")
+print(f"Identified {len(unique_users)-1} distinct active user identities.")
+ipydisplay(user_filter_w, status_filter_w, type_filter_w)
