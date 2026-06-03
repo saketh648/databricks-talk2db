@@ -1,17 +1,191 @@
-Requested Role
-Key Vault Secrets Officer (or a custom role containing ⁠Microsoft.KeyVault/vaults/secrets/write⁠ and ⁠Microsoft.KeyVault/vaults/secrets/read⁠)
-Assignment Scope
-Resource Level (Apply strictly to the specific Key Vault instance: ⁠kv-cus-syndvecx-dev-01⁠)
-Target Identity
-The Managed Identity (System-Assigned or User-Assigned) or Service Principal executing the credential-rotation script/pipeline.
-Detailed Justification for Security Review
- Business & Technical Context:
-The application relies on short-lived, temporary AWS S3 security tokens that automatically expire every 60 minutes. To maintain uninterrupted pipeline operations, an automated synchronization mechanism must fetch fresh temporary AWS tokens and dynamically update the designated Azure Key Vault secret on-demand prior to every pipeline execution.
- Principle of Least Privilege Alignment:
-The Key Vault Secrets Officer role is strictly limited to the Secrets data plane. It grants the pipeline the specific permissions required to write, update, and read secret values (⁠Microsoft.KeyVault/vaults/secrets/*⁠).
- Cryptographic Isolation:
-Unlike broader administrative roles, this assignment explicitly excludes management or data-action permissions over cryptographic keys (e.g., ⁠Microsoft.KeyVault/vaults/keys/*⁠) and certificates. This maintains strong cryptographic isolation, ensuring the pipeline cannot inadvertently alter, delete, or utilize corporate encryption keys.
- Scope Limitation:
-Access will be tightly scoped to the individual Key Vault resource instance in the dev environment (⁠kv-cus-syndvecx-dev-01⁠) rather than the entire resource group or subscription, preventing accidental cross-contamination of credentials.
-Required Permissions Breakdown
-If your security team prefers to create a granular Custom Azure RBAC Role instead of using the built-in Secrets Officer role, ensure it includes these exact Data Actions:
+import ipywidgets as widgets
+from IPython.display import display as ipydisplay
+
+# The consolidated list of your 15 Dedicated Pools + Serverless option
+pool_names_list = [
+    "All",
+    "Care_dev_dedicated",
+    "ac_operations__dev_dedicated_new",
+    "wcib_dev_dedicated",
+    "operations_and_enterprise_prod_dedicated",
+    "marketing_data_products_prod_dedicated",
+    "marketing_activation_dev_dedicated",
+    "special_projects__dev_dedicated",
+    "operations_and_enterprise_dev_dedicated",
+    "marketing_analytics__prod_dedicated",
+    "care_prod_dedicated",
+    "digital_prod_dedicated",
+    "marketing_analytics_dev_dedicated",
+    "digital_dev_dedicated",
+    "locations_analytics_prod_dedicated",
+    "wcib_prod_dedicated",
+    "Built-in (Serverless)"
+]
+
+# Build the interactive UI elements
+pool_type_w = widgets.Dropdown(options=["All", "Dedicated", "Serverless"], value="All", description="Pool Type:")
+pool_name_w = widgets.Dropdown(options=pool_names_list, value="All", description="Pool Name:")
+time_filter_w = widgets.Dropdown(options=["Past 1 Hour", "Past 4 Hours", "Past 24 Hours", "Past 3 Days"], value="Past 24 Hours", description="Time Range:")
+status_w = widgets.Dropdown(options=["All", "Completed", "Running", "Failed", "Cancelled"], value="All", description="Status:")
+
+print("--- STEP 1: SELECT CORE TARGET FILTERS BELOW ---")
+ipydisplay(pool_type_w, pool_name_w, time_filter_w, status_w)
+
+
+
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+# 1. READ FILTER PARAMETERS FROM CELL 1 WIDGETS
+v_type = pool_type_w.value
+v_name = pool_name_w.value
+v_time = time_filter_w.value
+v_status = status_w.value
+
+# Resolve lookback timelines
+days_lookback = 1; hours_lookback = 0
+if v_time == "Past 1 Hour":   days_lookback = 0; hours_lookback = 1
+elif v_time == "Past 4 Hours": days_lookback = 0; hours_lookback = 4
+elif v_time == "Past 3 Days":  days_lookback = 3; hours_lookback = 0
+
+print(f"Executing extraction loop for Scope: Type={v_type} | Pool={v_name} | Range={v_time}...\n")
+
+# 2. ENVIRONMENT AUTHENTICATION & TARGET MAPS
+token = mssparkutils.credentials.getToken("DW")
+synapse_sql_endpoint = "synw-synpeacx.sql.azuresynapse.net" 
+
+teams_config = [
+    {"team": "Care Team", "pool": "Care_dev_dedicated"},
+    {"team": "Operations Team", "pool": "ac_operations__dev_dedicated_new"},
+    {"team": "WCIB Corporate Team", "pool": "wcib_dev_dedicated"},
+    {"team": "Operations Team", "pool": "operations_and_enterprise_prod_dedicated"},
+    {"team": "Marketing Data Team", "pool": "marketing_data_products_prod_dedicated"},
+    {"team": "Marketing Act Team", "pool": "marketing_activation_dev_dedicated"},
+    {"team": "Special Projects Team", "pool": "special_projects__dev_dedicated"},
+    {"team": "Operations Team", "pool": "operations_and_enterprise_dev_dedicated"},
+    {"team": "Marketing Analyt Team", "pool": "marketing_analytics__prod_dedicated"},
+    {"team": "Care Team", "pool": "care_prod_dedicated"},
+    {"team": "Digital Product Team", "pool": "digital_prod_dedicated"},
+    {"team": "Marketing Analyt Team", "pool": "marketing_analytics_dev_dedicated"},
+    {"team": "Digital Product Team", "pool": "digital_dev_dedicated"},
+    {"team": "Location Analyt Team", "pool": "locations_analytics_prod_dedicated"},
+    {"team": "WCIB Corporate Team", "pool": "wcib_prod_dedicated"}
+]
+
+# Blueprint tracking matrix schema template
+schema_template = StructType([
+    StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
+    StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
+    StructField("QueryText", StringType(), True), StructField("Status", StringType(), True),
+    StructField("PoolType", StringType(), True), StructField("PoolName", StringType(), True),
+    StructField("TeamName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
+    StructField("EstimatedCostUSD", DoubleType(), True)
+])
+
+# 3. LIVE QUERY EXTRACTION FOR DEDICATED POOLS (VIA JDBC PASS-THROUGH)
+dedicated_dmv_query = f"""
+(
+    SELECT r.request_id AS ReqId, s.login_name AS UserIdentity, r.submit_time AS SubmitTime,
+           DATEDIFF(second, r.start_time, r.end_time) AS DurationSec, r.command AS QueryText, r.status AS Status
+    FROM sys.dm_pdw_exec_requests r JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
+    WHERE r.start_time >= DATEADD({ 'hour' if hours_lookback > 0 else 'day' }, -{ hours_lookback if hours_lookback > 0 else days_lookback }, GETDATE())
+) AS logs
+"""
+
+dedicated_dfs = []
+if v_type.lower() != "serverless" and (v_name == "All" or "serverless" not in v_name.lower()):
+    for cfg in teams_config:
+        if v_name != "All" and v_name != cfg["pool"]: continue
+        jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={cfg['pool']}"
+        print(f" -> Gathering Active Dedicated Metrics: {cfg['pool']}...")
+        try:
+            tmp_df = spark.read.format("jdbc").option("url", jdbc_url).option("dbtable", dedicated_dmv_query).option("accessToken", token).load()
+            tmp_df = tmp_df.withColumn("TeamName", F.lit(cfg["team"])).withColumn("PoolName", F.lit(cfg["pool"])).withColumn("PoolType", F.lit("Dedicated")).withColumn("DataProcessedGB", F.lit(0.0)).withColumn("EstimatedCostUSD", F.lit(0.0))
+            dedicated_dfs.append(tmp_df)
+        except:
+            pass
+
+if dedicated_dfs:
+    master_dedicated_df = dedicated_dfs[0]
+    for next_df in dedicated_dfs[1:]: master_dedicated_df = master_dedicated_df.unionByName(next_df)
+else:
+    master_dedicated_df = spark.createDataFrame([], schema_template)
+
+# 4. SERVERLESS LOG EXTRACTION (NATIVE RAW BLOB FILE STORAGE CRUISE)
+master_serverless_df = spark.createDataFrame([], schema_template)
+if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
+    print(" -> Scanning Storage Partitions for Built-in Serverless Analytics...")
+    try:
+        # Verified container path from image snippet
+        base_storage_path = "abfss://reqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net/PROVIDERS/MICROSOFT.SYNAPSE/WORKSPACES/SYNW-SYNPEACX/y=*/m=*/d=*/*/*.json"
+        
+        raw_storage_df = spark.read.json(base_storage_path)
+        
+        master_serverless_df = raw_storage_df.select(
+            F.col("properties.requestId").alias("ReqId"),
+            F.col("properties.identity").alias("UserIdentity"),
+            F.col("properties.startTime").alias("SubmitTime").cast(TimestampType()),
+            (F.unix_timestamp("properties.endTime") - F.unix_timestamp("properties.startTime")).alias("DurationSec"),
+            F.col("properties.queryText").alias("QueryText"),
+            F.col("properties.status").alias("Status"),
+            F.col("properties.dataProcessedBytes").cast(LongType()).alias("Bytes")
+        ).withColumn("PoolType", F.lit("Serverless"))\
+         .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
+         .withColumn("TeamName", F.lit("Shared Infrastructure"))\
+         .withColumn("DataProcessedGB", F.round(F.col("Bytes") / (1024.0*1024.0*1024.0), 3))\
+         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4)) \
+         .drop("Bytes")
+    except Exception as e:
+        print(f"    [Note] Storage path container is empty or compiling: {str(e)}")
+
+# 5. MERGE AND EVALUATE BASE STRINGS
+raw_master_df = master_dedicated_df.unionByName(master_serverless_df)
+
+base_filtered_df = raw_master_df.filter(
+    (F.lower(F.col("PoolType")) == v_type.lower()) | (F.lit(v_type) == "All")
+).filter(
+    (F.lower(F.col("PoolName")).contains("built-in")) if "serverless" in v_name.lower() else ((F.col("PoolName") == v_name) | (F.lit(v_name) == "All"))
+).filter(
+    (F.col("Status").rlike(f"(?i){v_status}")) | (F.lit(v_status) == "All")
+)
+
+base_filtered_df.cache()
+
+# 6. ASSEMBLE ADAPTIVE USER DROP-DOWN FILTER
+unique_users = [row['UserIdentity'] for row in base_filtered_df.select("UserIdentity").distinct().collect() if row['UserIdentity']]
+unique_users.sort()
+unique_users.insert(0, "All")
+
+user_filter_w = widgets.Dropdown(options=unique_users, value="All", description="View User:")
+print(f"\n--- SUCCESS: Logs Loaded! {len(unique_users)-1} identities identified. ---")
+print("Select a user target below to isolate operational representations:")
+ipydisplay(user_filter_w)
+
+
+
+
+
+
+
+v_user = user_filter_w.value
+
+# Slice in-memory cached logs instantly 
+final_dashboard_df = base_filtered_df.filter((F.col("UserIdentity") == v_user) | (F.lit(v_user) == "All")) \
+                                     .orderBy(F.col("SubmitTime").desc())
+
+# Calculate metric summary values
+total_queries = final_dashboard_df.count()
+total_serverless_cost = final_dashboard_df.filter(F.col("PoolType") == "Serverless").select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
+avg_execution_time = final_dashboard_df.select(F.avg("DurationSec")).collect()[0][0] or 0.0
+
+# Print clean KPI cards at the top of the canvas
+print("=" * 85)
+print(f"                     📊 INTERACTIVE METRIC DISCOVERY FOR: {v_user.upper()} ")
+print("=" * 85)
+print(f"   🔹 Total Active Queries Run in Window : {total_queries}")
+print(f"   💸 Accumulated Serverless Query Cost  : ${round(total_serverless_cost, 4)}")
+print(f"   ⏱️ Average Transaction Run Speed     : {round(avg_execution_time, 2)} Seconds")
+print("=" * 85 + "\n")
+
+display(final_dashboard_df)
