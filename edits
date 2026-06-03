@@ -1,52 +1,189 @@
-# -------------------------------------------------------------------------
-# CELL 3: ADAPTIVE CANVAS WITH AUTOMATIC ENGINE SEPARATION
-# -------------------------------------------------------------------------
-v_user = user_filter_w.value
+import ipywidgets as widgets
+from IPython.display import display as ipydisplay
 
-# 1. Fast slice the cached logs in memory
+pool_names_list = [
+    "All", "Care_dev_dedicated", "ac_operations__dev_dedicated_new", "wcib_dev_dedicated",
+    "operations_and_enterprise_prod_dedicated", "marketing_data_products_prod_dedicated", 
+    "marketing_activation_dev_dedicated", "special_projects__dev_dedicated", 
+    "operations_and_enterprise_dev_dedicated", "marketing_analytics__prod_dedicated", 
+    "care_prod_dedicated", "digital_prod_dedicated", "marketing_analytics_dev_dedicated", 
+    "digital_dev_dedicated", "locations_analytics_prod_dedicated", "wcib_prod_dedicated", 
+    "Built-in (Serverless)"
+]
+
+pool_type_w = widgets.Dropdown(options=["All", "Dedicated", "Serverless"], value="All", description="Pool Type:")
+pool_name_w = widgets.Dropdown(options=pool_names_list, value="All", description="Pool Name:")
+time_filter_w = widgets.Dropdown(options=["Past 1 Hour", "Past 4 Hours", "Past 24 Hours", "Past 3 Days"], value="Past 24 Hours", description="Time Range:")
+
+print("--- STEP 1: SELECT INFRASTRUCTURE TARGET SCOPE ---")
+ipydisplay(pool_type_w, pool_name_w, time_filter_w)
+
+
+
+
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
+v_type = pool_type_w.value; v_name = pool_name_w.value; v_time = time_filter_w.value
+
+days_lookback = 1; hours_lookback = 0
+if v_time == "Past 1 Hour":   days_lookback = 0; hours_lookback = 1
+elif v_time == "Past 4 Hours": days_lookback = 0; hours_lookback = 4
+elif v_time == "Past 3 Days":  days_lookback = 3; hours_lookback = 0
+
+print(f"Caching central dataset for Scope: Type={v_type} | Pool={v_name} | Range={v_time}...\n")
+
+token = mssparkutils.credentials.getToken("DW")
+synapse_sql_endpoint = "synw-synpeacx.sql.azuresynapse.net" 
+
+pools_list = [
+    "Care_dev_dedicated", "ac_operations__dev_dedicated_new", "wcib_dev_dedicated",
+    "operations_and_enterprise_prod_dedicated", "marketing_data_products_prod_dedicated",
+    "marketing_activation_dev_dedicated", "special_projects__dev_dedicated",
+    "operations_and_enterprise_dev_dedicated", "marketing_analytics__prod_dedicated",
+    "care_prod_dedicated", "digital_prod_dedicated", "marketing_analytics_dev_dedicated",
+    "digital_dev_dedicated", "locations_analytics_prod_dedicated", "wcib_prod_dedicated"
+]
+
+# Clean blueprint template schema (TeamName dropped, QueryType added)
+schema_template = StructType([
+    StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
+    StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
+    StructField("QueryText", StringType(), True), StructField("QueryType", StringType(), True),
+    StructField("Status", StringType(), True), StructField("PoolType", StringType(), True), 
+    StructField("PoolName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
+    StructField("EstimatedCostUSD", DoubleType(), True)
+])
+
+# 1. DEDICATED EXTRACTOR LOOP
+dedicated_dmv_query = f"""
+(
+    SELECT r.request_id AS ReqId, s.login_name AS UserIdentity, r.submit_time AS SubmitTime,
+           DATEDIFF(second, r.start_time, r.end_time) AS DurationSec, r.command AS QueryText, r.status AS Status
+    FROM sys.dm_pdw_exec_requests r JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
+    WHERE r.start_time >= DATEADD({ 'hour' if hours_lookback > 0 else 'day' }, -{ hours_lookback if hours_lookback > 0 else days_lookback }, GETDATE())
+) AS logs
+"""
+
+dedicated_dfs = []
+if v_type.lower() != "serverless" and (v_name == "All" or "serverless" not in v_name.lower()):
+    for p_name in pools_list:
+        if v_name != "All" and v_name != p_name: continue
+        jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={p_name}"
+        try:
+            tmp_df = spark.read.format("jdbc").option("url", jdbc_url).option("dbtable", dedicated_dmv_query).option("accessToken", token).load()
+            tmp_df = tmp_df.withColumn("PoolName", F.lit(p_name))\
+                           .withColumn("PoolType", F.lit("Dedicated"))\
+                           .withColumn("DataProcessedGB", F.lit(0.0))\
+                           .withColumn("EstimatedCostUSD", F.lit(0.0))
+            dedicated_dfs.append(tmp_df)
+        except: pass
+
+if dedicated_dfs:
+    master_dedicated_df = dedicated_dfs[0]
+    for next_df in dedicated_dfs[1:]: master_dedicated_df = master_dedicated_df.unionByName(next_df)
+else:
+    master_dedicated_df = spark.createDataFrame([], schema_template.drop("QueryType"))
+
+# 2. SERVERLESS EXTRACTOR CRAWL
+master_serverless_df = spark.createDataFrame([], schema_template.drop("QueryType"))
+if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
+    try:
+        base_storage_path = (
+            "abfss://insights-logs-builtinsqlreqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net"
+            "/resourceId=/SUBSCRIPTIONS/0A03E58F-29BD-4793-988F-F25C58CC7E1E"
+            "/RESOURCEGROUPS/RG-CUS-SYNPEACX-PROD-01"
+            "/PROVIDERS/MICROSOFT.SYNAPSE"
+            "/WORKSPACES/SYNW-SYNPEACX"
+            "/y=*/m=*/d=*/h=*/m=*/PT1H.json"
+        )
+        raw_storage_df = spark.read.json(base_storage_path)
+        master_serverless_df = raw_storage_df.select(
+            F.col("properties.clientRequestId").alias("ReqId"),
+            F.col("identity.loginName").alias("UserIdentity"),
+            F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
+            (F.unix_timestamp("properties.endTime") - F.unix_timestamp("properties.startTime")).alias("DurationSec"),
+            F.col("properties.command").alias("QueryText"),
+            F.when(F.col("properties.error").isNotNull(), F.lit("Failed")).otherwise(F.lit("Completed")).alias("Status"),
+            F.col("properties.dataProcessedBytes").cast(LongType()).alias("Bytes")
+        ).withColumn("PoolType", F.lit("Serverless"))\
+         .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
+         .withColumn("DataProcessedGB", F.round(F.col("Bytes") / (1024.0*1024.0*1024.0), 3))\
+         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4)) \
+         .drop("Bytes")
+    except: pass
+
+# 3. MERGE CORE ENGINES
+raw_master_df = master_dedicated_df.unionByName(master_serverless_df)
+
+# 4. INTRODUCE SMART WORKLOAD CLASSIFIER TO MAKE TEAM AUDITING EASIER
+clean_master_df = raw_master_df.withColumn(
+    "QueryType",
+    F.when(F.lower(F.col("QueryText")).rlike("^\s*select"), F.lit("SELECT (Read)"))
+     .when(F.lower(F.col("QueryText")).rlike("^\s*(insert|update|delete|merge)"), F.lit("DML (Write)"))
+     .when(F.lower(F.col("QueryText")).rlike("^\s*(create|alter|drop|truncate)"), F.lit("DDL (Schema)"))
+     .otherwise(F.lit("System/Procedure"))
+)
+
+# 5. COARSE INFRASTRUCTURE FILTERING
+base_filtered_df = clean_master_df.filter(
+    (F.lower(F.col("PoolType")) == v_type.lower()) | (F.lit(v_type) == "All")
+).filter(
+    (F.lower(F.col("PoolName")).contains("built-in")) if "serverless" in v_name.lower() else ((F.col("PoolName") == v_name) | (F.lit(v_name) == "All"))
+)
+
+base_filtered_df.cache()
+
+# 6. GENERATE INTERACTIVE DESKTOP DROPDOWNS
+unique_users = [row['UserIdentity'] for row in base_filtered_df.select("UserIdentity").distinct().collect() if row['UserIdentity']]
+unique_users.sort(); unique_users.insert(0, "All")
+
+user_filter_w = widgets.Dropdown(options=unique_users, value="All", description="View User:")
+status_filter_w = widgets.Dropdown(options=["All", "Completed", "Running", "Failed", "Cancelled"], value="All", description="Query Status:")
+type_filter_w = widgets.Dropdown(options=["All", "SELECT (Read)", "DML (Write)", "DDL (Schema)", "System/Procedure"], value="All", description="Command Class:")
+
+print(f"--- SUCCESS: Base Master Sets Cached In-Memory! ---")
+ipydisplay(user_filter_w, status_filter_w, type_filter_w)
+
+
+
+
+v_user = user_filter_w.value
+v_status = status_filter_w.value
+v_qtype = type_filter_w.value
+
+# 1. Micro-slice in memory cache instantly across User, Status, and Query Type
 final_dashboard_df = base_filtered_df.filter((F.col("UserIdentity") == v_user) | (F.lit(v_user) == "All")) \
+                                     .filter((F.col("Status").rlike(f"(?i){v_status}")) | (F.lit(v_status) == "All")) \
+                                     .filter((F.col("QueryType") == v_qtype) | (F.lit(v_qtype) == "All")) \
                                      .orderBy(F.col("SubmitTime").desc())
 
-# 2. Compute underlying metrics
+# 2. Compute summary analytics values
 total_queries = final_dashboard_df.count()
 avg_execution_time = final_dashboard_df.select(F.avg("DurationSec")).collect()[0][0] or 0.0
 
-# Check if we are currently looking at Serverless data or Dedicated data
 is_serverless_scope = final_dashboard_df.filter(F.col("PoolType") == "Serverless").count() > 0
 is_dedicated_scope = final_dashboard_df.filter(F.col("PoolType") == "Dedicated").count() > 0
 
 print("=" * 85)
-print(f"                     📊 INTERACTIVE ANALYSIS FOR: {v_user.upper()} ")
+print(f"  📊 METRICS CANVAS | USER: {v_user.upper()} | STATUS: {v_status.upper()} | TYPE: {v_qtype.upper()} ")
 print("=" * 85)
-print(f"   🔹 Total Active Queries Run in Window : {total_queries}")
-print(f"   ⏱️ Average Transaction Run Speed     : {round(avg_execution_time, 2)} Seconds")
+print(f"   🔹 Filtered Query Count in Current View : {total_queries}")
+print(f"   ⏱️ Selected Window Avg Execution Speed : {round(avg_execution_time, 2)} Seconds")
 
-# 3. SEPARATED PERFORMANCE & COST DISCOVERY CARDS
+# 3. SPLIT COST/CAPACITY SUMMARY DISPLAYS
 if is_serverless_scope and not is_dedicated_scope:
-    # Pure Serverless Cost Tracking Mode
     total_serverless_cost = final_dashboard_df.select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
     total_data_scanned = final_dashboard_df.select(F.sum("DataProcessedGB")).collect()[0][0] or 0.0
-    print(f"   💾 Total Data Lake Storage Scanned    : {round(total_data_scanned, 3)} GB")
-    print(f"   💸 Accumulated Consumption Cost      : ${round(total_serverless_cost, 4)}")
-    print("-" * 85)
-    print("   💡 NOTE: Serverless is billed per query at $5.00/TB of data scanned from storage.")
-
+    print(f"   💾 Total Data Lake Storage Scanned     : {round(total_data_scanned, 3)} GB")
+    print(f"   💸 Accumulated Consumption Cost       : ${round(total_serverless_cost, 4)}")
 elif is_dedicated_scope and not is_serverless_scope:
-    # Pure Dedicated Concurrency Tracking Mode
     longest_query = final_dashboard_df.select(F.max("DurationSec")).collect()[0][0] or 0.0
-    print(f"   🚀 Peak Single Query Runtime         : {longest_query} Seconds")
-    print("-" * 85)
-    print("   💡 NOTE: Dedicated Pools are billed on flat capacity rates based on DWU block sizing.")
-    print("            Columns 'DataProcessedGB' and 'EstimatedCostUSD' apply exclusively to Serverless.")
-
+    print(f"   🚀 Peak Single Query Runtime           : {longest_query} Seconds")
 else:
-    # Blended/All View Mode
     total_serverless_cost = final_dashboard_df.filter(F.col("PoolType") == "Serverless").select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
-    print(f"   💸 Total Serverless Segment Cost      : ${round(total_serverless_cost, 4)}")
-    print("-" * 85)
-    print("   💡 TIP: Use the 'Pool Type' dropdown to isolate specific infrastructure pricing tracks.")
-
+    print(f"   💸 Total Serverless Segment Cost       : ${round(total_serverless_cost, 4)}")
 print("=" * 85 + "\n")
 
-# 4. OUTPUT GRAPHICAL CANVAS Grid
 display(final_dashboard_df)
