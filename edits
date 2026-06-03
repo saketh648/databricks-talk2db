@@ -1,13 +1,22 @@
-# 4. SERVERLESS LOG EXTRACTION (CASE-SENSITIVE PATH CORRECTION)
+# 4. SERVERLESS LOG EXTRACTION (ABSOLUTE FULL PATH CORRECTION)
 master_serverless_df = spark.createDataFrame([], schema_template)
 if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
-    print(" -> Direct-Crawling Storage Partition Logs for Built-in Serverless...")
+    print(" -> Direct-Crawling Explicit Storage Paths for Built-in Serverless...")
     try:
-        # FIXED: Converted path to lowercase to match ADLS Gen2 case-sensitivity requirements
-        base_storage_path = "abfss://reqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net/providers/microsoft.synapse/workspaces/synw-synpeacx/y=*/m=*/d=*/*/*.json"
+        # EXACT MATCH: Reconstructed path targeting your absolute corporate Azure architecture
+        base_storage_path = (
+            "abfss://insights-logs-builtinsqlreqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net"
+            "/resourceId=/SUBSCRIPTIONS/0A03E58F-29BD-4793-988F-F25C58CC7E1E"
+            "/RESOURCEGROUPS/RG-CUS-SYNPEACX-PROD-01"
+            "/PROVIDERS/MICROSOFT.SYNAPSE"
+            "/WORKSPACES/SYNW-SYNPEACX"
+            "/y=*/m=*/d=*/*/*.json"
+        )
         
+        # Read the time-partitioned JSON files
         raw_storage_df = spark.read.json(base_storage_path)
         
+        # Extract and format properties to match our master dashboard schema
         master_serverless_df = raw_storage_df.select(
             F.col("properties.requestId").alias("ReqId"),
             F.col("properties.identity").alias("UserIdentity"),
@@ -22,5 +31,6 @@ if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.l
          .withColumn("DataProcessedGB", F.round(F.col("Bytes") / (1024.0*1024.0*1024.0), 3))\
          .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4)) \
          .drop("Bytes")
+         
     except Exception as e:
-        print(f"    [Note] No storage logs compiled for this timeframe yet: {str(e)}")
+        print(f"    [Note] No storage logs compiled for this timeframe yet or access restricted: {str(e)}")
