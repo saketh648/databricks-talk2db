@@ -1,27 +1,3 @@
-import ipywidgets as widgets
-from IPython.display import display as ipydisplay
-
-pool_names_list = [
-    "All", "Care_dev_dedicated", "ac_operations__dev_dedicated_new", "wcib_dev_dedicated",
-    "operations_and_enterprise_prod_dedicated", "marketing_data_products_prod_dedicated", 
-    "marketing_activation_dev_dedicated", "special_projects__dev_dedicated", 
-    "operations_and_enterprise_dev_dedicated", "marketing_analytics__prod_dedicated", 
-    "care_prod_dedicated", "digital_prod_dedicated", "marketing_analytics_dev_dedicated", 
-    "digital_dev_dedicated", "locations_analytics_prod_dedicated", "wcib_prod_dedicated", 
-    "Built-in (Serverless)"
-]
-
-pool_type_w = widgets.Dropdown(options=["All", "Dedicated", "Serverless"], value="All", description="Pool Type:")
-pool_name_w = widgets.Dropdown(options=pool_names_list, value="All", description="Pool Name:")
-time_filter_w = widgets.Dropdown(options=["Past 1 Hour", "Past 4 Hours", "Past 24 Hours", "Past 3 Days"], value="Past 24 Hours", description="Time Range:")
-
-print("--- STEP 1: SELECT INFRASTRUCTURE TARGET SCOPE ---")
-ipydisplay(pool_type_w, pool_name_w, time_filter_w)
-
-
-
-
-
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
 
@@ -46,14 +22,13 @@ pools_list = [
     "digital_dev_dedicated", "locations_analytics_prod_dedicated", "wcib_prod_dedicated"
 ]
 
-# Clean blueprint template schema (TeamName dropped, QueryType added)
+# FIXED: Blueprint schema represents the exact incoming structural format before transformation
 schema_template = StructType([
     StructField("ReqId", StringType(), True), StructField("UserIdentity", StringType(), True),
     StructField("SubmitTime", TimestampType(), True), StructField("DurationSec", LongType(), True),
-    StructField("QueryText", StringType(), True), StructField("QueryType", StringType(), True),
-    StructField("Status", StringType(), True), StructField("PoolType", StringType(), True), 
-    StructField("PoolName", StringType(), True), StructField("DataProcessedGB", DoubleType(), True),
-    StructField("EstimatedCostUSD", DoubleType(), True)
+    StructField("QueryText", StringType(), True), StructField("Status", StringType(), True),
+    StructField("PoolType", StringType(), True), StructField("PoolName", StringType(), True),
+    StructField("DataProcessedGB", DoubleType(), True), StructField("EstimatedCostUSD", DoubleType(), True)
 ])
 
 # 1. DEDICATED EXTRACTOR LOOP
@@ -80,14 +55,15 @@ if v_type.lower() != "serverless" and (v_name == "All" or "serverless" not in v_
             dedicated_dfs.append(tmp_df)
         except: pass
 
+# FIXED: Fallback constructs cleanly without trying to execute a .drop() attribute
 if dedicated_dfs:
     master_dedicated_df = dedicated_dfs[0]
     for next_df in dedicated_dfs[1:]: master_dedicated_df = master_dedicated_df.unionByName(next_df)
 else:
-    master_dedicated_df = spark.createDataFrame([], schema_template.drop("QueryType"))
+    master_dedicated_df = spark.createDataFrame([], schema_template)
 
 # 2. SERVERLESS EXTRACTOR CRAWL
-master_serverless_df = spark.createDataFrame([], schema_template.drop("QueryType"))
+master_serverless_df = spark.createDataFrame([], schema_template)
 if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
     try:
         base_storage_path = (
@@ -145,45 +121,3 @@ type_filter_w = widgets.Dropdown(options=["All", "SELECT (Read)", "DML (Write)",
 
 print(f"--- SUCCESS: Base Master Sets Cached In-Memory! ---")
 ipydisplay(user_filter_w, status_filter_w, type_filter_w)
-
-
-
-
-v_user = user_filter_w.value
-v_status = status_filter_w.value
-v_qtype = type_filter_w.value
-
-# 1. Micro-slice in memory cache instantly across User, Status, and Query Type
-final_dashboard_df = base_filtered_df.filter((F.col("UserIdentity") == v_user) | (F.lit(v_user) == "All")) \
-                                     .filter((F.col("Status").rlike(f"(?i){v_status}")) | (F.lit(v_status) == "All")) \
-                                     .filter((F.col("QueryType") == v_qtype) | (F.lit(v_qtype) == "All")) \
-                                     .orderBy(F.col("SubmitTime").desc())
-
-# 2. Compute summary analytics values
-total_queries = final_dashboard_df.count()
-avg_execution_time = final_dashboard_df.select(F.avg("DurationSec")).collect()[0][0] or 0.0
-
-is_serverless_scope = final_dashboard_df.filter(F.col("PoolType") == "Serverless").count() > 0
-is_dedicated_scope = final_dashboard_df.filter(F.col("PoolType") == "Dedicated").count() > 0
-
-print("=" * 85)
-print(f"  📊 METRICS CANVAS | USER: {v_user.upper()} | STATUS: {v_status.upper()} | TYPE: {v_qtype.upper()} ")
-print("=" * 85)
-print(f"   🔹 Filtered Query Count in Current View : {total_queries}")
-print(f"   ⏱️ Selected Window Avg Execution Speed : {round(avg_execution_time, 2)} Seconds")
-
-# 3. SPLIT COST/CAPACITY SUMMARY DISPLAYS
-if is_serverless_scope and not is_dedicated_scope:
-    total_serverless_cost = final_dashboard_df.select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
-    total_data_scanned = final_dashboard_df.select(F.sum("DataProcessedGB")).collect()[0][0] or 0.0
-    print(f"   💾 Total Data Lake Storage Scanned     : {round(total_data_scanned, 3)} GB")
-    print(f"   💸 Accumulated Consumption Cost       : ${round(total_serverless_cost, 4)}")
-elif is_dedicated_scope and not is_serverless_scope:
-    longest_query = final_dashboard_df.select(F.max("DurationSec")).collect()[0][0] or 0.0
-    print(f"   🚀 Peak Single Query Runtime           : {longest_query} Seconds")
-else:
-    total_serverless_cost = final_dashboard_df.filter(F.col("PoolType") == "Serverless").select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
-    print(f"   💸 Total Serverless Segment Cost       : ${round(total_serverless_cost, 4)}")
-print("=" * 85 + "\n")
-
-display(final_dashboard_df)
