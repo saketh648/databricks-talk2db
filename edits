@@ -1,1 +1,17 @@
-Server=tcp:yourserver.database.windows.net,1433;Initial Catalog=yourdb;Authentication=Active Directory Password;User ID=yourusername@yourdomain.com;Password=yourpassword;
+Requested Role
+Key Vault Secrets Officer (or a custom role containing ⁠Microsoft.KeyVault/vaults/secrets/write⁠ and ⁠Microsoft.KeyVault/vaults/secrets/read⁠)
+Assignment Scope
+Resource Level (Apply strictly to the specific Key Vault instance: ⁠kv-cus-syndvecx-dev-01⁠)
+Target Identity
+The Managed Identity (System-Assigned or User-Assigned) or Service Principal executing the credential-rotation script/pipeline.
+Detailed Justification for Security Review
+ Business & Technical Context:
+The application relies on short-lived, temporary AWS S3 security tokens that automatically expire every 60 minutes. To maintain uninterrupted pipeline operations, an automated synchronization mechanism must fetch fresh temporary AWS tokens and dynamically update the designated Azure Key Vault secret on-demand prior to every pipeline execution.
+ Principle of Least Privilege Alignment:
+The Key Vault Secrets Officer role is strictly limited to the Secrets data plane. It grants the pipeline the specific permissions required to write, update, and read secret values (⁠Microsoft.KeyVault/vaults/secrets/*⁠).
+ Cryptographic Isolation:
+Unlike broader administrative roles, this assignment explicitly excludes management or data-action permissions over cryptographic keys (e.g., ⁠Microsoft.KeyVault/vaults/keys/*⁠) and certificates. This maintains strong cryptographic isolation, ensuring the pipeline cannot inadvertently alter, delete, or utilize corporate encryption keys.
+ Scope Limitation:
+Access will be tightly scoped to the individual Key Vault resource instance in the dev environment (⁠kv-cus-syndvecx-dev-01⁠) rather than the entire resource group or subscription, preventing accidental cross-contamination of credentials.
+Required Permissions Breakdown
+If your security team prefers to create a granular Custom Azure RBAC Role instead of using the built-in Secrets Officer role, ensure it includes these exact Data Actions:
