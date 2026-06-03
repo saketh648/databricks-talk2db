@@ -1,4 +1,4 @@
-# 4. SERVERLESS LOG EXTRACTION (FLAT SCHEMA MAP CORRECTION)
+# 4. SERVERLESS LOG EXTRACTION (FINAL VERIFIED SCHEMA PATTERN)
 master_serverless_df = spark.createDataFrame([], schema_template)
 if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
     print(" -> Direct-Crawling Explicit Storage Paths for Built-in Serverless...")
@@ -14,16 +14,15 @@ if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.l
         
         raw_storage_df = spark.read.json(base_storage_path)
         
-        # FIXED: Removed 'properties.' prefix and mapped fields directly based on your error log
+        # FINAL CORRECTION: Mapping based on your exact schema definition rules
         master_serverless_df = raw_storage_df.select(
-            F.col("clientRequestId").alias("ReqId"),
-            # Note: If 'identity' isn't in your field list, we substitute an 'Unknown' literal or try to fallback
-            (F.col("identity") if "identity" in raw_storage_df.columns else F.lit("System/Unknown")).alias("UserIdentity"),
-            F.col("startTime").cast(TimestampType()).alias("SubmitTime"),
-            (F.unix_timestamp("endTime") - F.unix_timestamp("startTime")).alias("DurationSec"),
-            F.col("queryText").alias("QueryText"),
-            F.col("status").alias("Status"),
-            F.col("dataProcessedBytes").cast(LongType()).alias("Bytes")
+            F.col("properties.clientRequestId").alias("ReqId"),
+            F.col("identity").alias("UserIdentity"), # Pulled from flat root
+            F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
+            (F.unix_timestamp("properties.endTime") - F.unix_timestamp("properties.startTime")).alias("DurationSec"),
+            F.col("properties.queryText").alias("QueryText"),
+            F.col("properties.status").alias("Status"),
+            F.col("properties.dataProcessedBytes").cast(LongType()).alias("Bytes")
         ).withColumn("PoolType", F.lit("Serverless"))\
          .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
          .withColumn("TeamName", F.lit("Shared Infrastructure"))\
