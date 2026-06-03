@@ -1,10 +1,10 @@
-# 4. SERVERLESS LOG EXTRACTION (CORRECTED STORAGE CONTAINER PATH)
+# 4. SERVERLESS LOG EXTRACTION (CASE-SENSITIVE PATH CORRECTION)
 master_serverless_df = spark.createDataFrame([], schema_template)
 if v_type.lower() == "serverless" or v_name == "All" or "serverless" in v_name.lower():
     print(" -> Direct-Crawling Storage Partition Logs for Built-in Serverless...")
     try:
-        # FIXED: Removed the extra wildcard tier right before the y=* string
-        base_storage_path = "abfss://reqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net/PROVIDERS/MICROSOFT.SYNAPSE/WORKSPACES/SYNW-SYNPEACX/y=*/m=*/d=*/*/*.json"
+        # FIXED: Converted path to lowercase to match ADLS Gen2 case-sensitivity requirements
+        base_storage_path = "abfss://reqsended@sasdlc1zpii01psynpeacx02.dfs.core.windows.net/providers/microsoft.synapse/workspaces/synw-synpeacx/y=*/m=*/d=*/*/*.json"
         
         raw_storage_df = spark.read.json(base_storage_path)
         
