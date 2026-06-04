@@ -1,1 +1,1 @@
-https://management.azure.com/subscriptions/241f8112-4687-4490-aa9f-b513a83ea434/resourceGroups/rg-cus-syndvecx-dev-01/providers/Microsoft.Synapse/workspaces/synw-syndvecx/sqlPools/wcib_dedicated/pause?api-version=2021-06-01
+https://management.azure.com/subscriptions/241f8112-4687-4490-aa9f-b513a83ea434/resourceGroups/rg-cus-syndvecx-dev-01/providers/Microsoft.Sql/servers/synw-syndvecx/databases/wcib_dedicated/resume?api-version=2021-11-01
