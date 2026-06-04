@@ -1,21 +1,19 @@
 # -------------------------------------------------------------------------
-# NEW COMPONENT: DYNAMIC DEDICATED UPTIME & FIXED COST AUDITOR
+# FIXED COMPONENT: DYNAMIC DEDICATED UPTIME & INFRASTRUCTURE BILLING
 # -------------------------------------------------------------------------
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
-import datetime
+import time
 
-# 1. SET TARGET PARAMETERS FROM UI WIDGETS
 v_pool_select = pool_name_w.value
 v_time_select = time_filter_w.value
 
-# Resolve lookback hours baseline
+# Resolve exact tracking window hours
 hours_window = 24.0
 if v_time_select == "Past 1 Hour":    hours_window = 1.0
 elif v_time_select == "Past 4 Hours": hours_window = 4.0
 elif v_time_select == "Past 3 Days":  hours_window = 72.0
 
-# Enterprise hourly cost rate matrix ($ price per hour when running)
 dedicated_hourly_rates = {
     "Care_dev_dedicated": 1.51,
     "ac_operations__dev_dedicated_new": 1.51,
@@ -34,66 +32,45 @@ dedicated_hourly_rates = {
     "wcib_prod_dedicated": 15.10
 }
 
-# 2. INTERNAL HEALTH DMV QUERY SCHEMA
-# Scans the fabric layer to track exact component changes for the SQL Engine compute nodes
-health_dmv_query = """
-(
-    SELECT component_name, status, updated_time 
-    FROM sys.dm_pdw_component_health_status
-    WHERE component_name = 'SQL Engine'
-) AS health_track
-"""
-
-print(f"--- 🔍 ANALYZING TRUE COMPUTE UPTIME FOR WINDOW: {v_time_select} ({int(hours_window)} Hours) ---")
+print(f"--- 🔍 LIVE INFRASTRUCTURE ANALYSIS: {v_time_select} ({int(hours_window)} Hours) ---")
 
 token = mssparkutils.credentials.getToken("DW")
 synapse_sql_endpoint = "synw-synpeacx.sql.azuresynapse.net"
-
-# Dictionary to hold the calculated true active hours for each pool
 calculated_uptime_hours = {}
 
-# 3. INTERROGATE CLUSTER HEALTH LAYER VIA JDBC PASS-THROUGH
+# 1. RESILIENT CHECKING PASS
 for p_name, hourly_rate in dedicated_hourly_rates.items():
     if v_pool_select != "All" and v_pool_select != p_name:
         continue
         
-    jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={p_name}"
+    jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={p_name};loginTimeout=3;"
+    
+    # We query a basic internal catalog table to verify if the engine is awake and responding
+    check_active_query = "(SELECT TOP 1 OBJECT_ID FROM sys.objects) AS active_test"
     
     try:
-        # Query the health status DMV with a strict 4-second timeout gateway
-        health_df = spark.read.format("jdbc") \
-                        .option("url", jdbc_url) \
-                        .option("dbtable", health_dmv_query) \
-                        .option("accessToken", token) \
-                        .option("queryTimeout", "4") \
-                        .load()
-                        
-        # Sort state records to verify the most recent state change
-        latest_state = health_df.orderBy(F.col("updated_time").desc()).first()
+        # Test connection status rapidly
+        test_df = spark.read.format("jdbc") \
+                    .option("url", jdbc_url) \
+                    .option("dbtable", check_active_query) \
+                    .option("accessToken", token) \
+                    .load()
         
-        if latest_state and latest_state["status"].lower() == "active":
-            # Pool is online. In production, you can expand this block to calculate 
-            # granular sub-hour intervals if paused/resumed multiple times.
-            calculated_uptime_hours[p_name] = hours_window
-        else:
-            # Component is reported in a non-active or suspending/paused phase
-            calculated_uptime_hours[p_name] = 0.0
-            
+        # If the query succeeds, the pool is completely online and active
+        calculated_uptime_hours[p_name] = hours_window
     except Exception as e:
-        # CATCH TIMEOUTS: If a Dedicated Pool is completely paused/stopped, 
-        # the JDBC connection endpoint goes entirely dark and times out.
-        # This confirms the infrastructure was idle/offline and cost $0.00.
+        # If it catches an exception (Database paused/unavailable), it logs it as 0 hours
+        # without breaking the loops for your other running databases!
         calculated_uptime_hours[p_name] = 0.0
 
-# 4. RENDER TRUE COMPUTE BILLING DISCOVERY SHEET
+# 2. OUTPUT CLEAN INFRASTRUCTURE ACCOUNTING STATEMENT
 print("=" * 85)
 print("             💰 TRUE FIXED INFRASTRUCTURE ACCOUNTING METRICS ")
 print("=" * 85)
-
-total_workspace_fixed_cost = 0.0
-print(f"{'Dedicated Pool Name':<45} | {'Uptime Status':<12} | {'Active Hours':<12} | {'True Fixed Cost':<15}")
+print(f"{'Dedicated Pool Name':<45} | {'Status':<12} | {'Active Hours':<12} | {'True Fixed Cost':<15}")
 print("-" * 85)
 
+total_workspace_fixed_cost = 0.0
 for p_name, active_hours in calculated_uptime_hours.items():
     rate = dedicated_hourly_rates[p_name]
     pool_cost = rate * active_hours
@@ -105,4 +82,3 @@ for p_name, active_hours in calculated_uptime_hours.items():
 print("-" * 85)
 print(f" 🔥 TOTAL ACCUMULATED FIXED COMPUTE CAPACITY LIABILITY: ${total_workspace_fixed_cost:,.2f}")
 print("=" * 85)
-print("💡 Use the grid cells below to audit the granular user query queries run during active periods.")
