@@ -1,84 +1,55 @@
 # -------------------------------------------------------------------------
-# FIXED COMPONENT: DYNAMIC DEDICATED UPTIME & INFRASTRUCTURE BILLING
+# CELL 1: SCALING-AWARE HISTORICAL INFRASTRUCTURE ENGINE
 # -------------------------------------------------------------------------
 from pyspark.sql import functions as F
 from pyspark.sql.types import *
-import time
 
 v_pool_select = pool_name_w.value
 v_time_select = time_filter_w.value
 
-# Resolve exact tracking window hours
-hours_window = 24.0
-if v_time_select == "Past 1 Hour":    hours_window = 1.0
-elif v_time_select == "Past 4 Hours": hours_window = 4.0
-elif v_time_select == "Past 3 Days":  hours_window = 72.0
+# Determine lookback interval for the Azure system tables
+days_back = 1
+if v_time_select == "Past 3 Days": days_back = 3
 
-dedicated_hourly_rates = {
-    "Care_dev_dedicated": 1.51,
-    "ac_operations__dev_dedicated_new": 1.51,
-    "wcib_dev_dedicated": 1.51,
-    "operations_and_enterprise_prod_dedicated": 15.10, 
-    "marketing_data_products_prod_dedicated": 15.10,
-    "marketing_activation_dev_dedicated": 1.51,
-    "special_projects__dev_dedicated": 1.51,
-    "operations_and_enterprise_dev_dedicated": 1.51,
-    "marketing_analytics__prod_dedicated": 15.10,
-    "care_prod_dedicated": 15.10,
-    "digital_prod_dedicated": 15.10,
-    "marketing_analytics_dev_dedicated": 1.51,
-    "digital_dev_dedicated": 1.51,
-    "locations_analytics_prod_dedicated": 15.10,
-    "wcib_prod_dedicated": 15.10
-}
+# Base pricing scale multiplier: Azure Dedicated Pools cost approx $0.0151 per DWU per hour
+# Example: DW100c = 100 * 0.0151 = $1.51/hr | DW1000c = 1000 * 0.0151 = $15.10/hr
+DWU_HOURLY_BASE_RATE = 0.0151
 
-print(f"--- 🔍 LIVE INFRASTRUCTURE ANALYSIS: {v_time_select} ({int(hours_window)} Hours) ---")
+# Query the master system notification history to track raw ALTER DATABASE scale commands
+scale_history_query = f"""
+(
+    SELECT 
+        LOWER(p.name) as PoolName,
+        h.command_text as Command,
+        h.event_timestamp as EventTime
+    FROM sys.dm_pdw_request_notification_history h
+    JOIN sys.databases p ON h.database_id = p.database_id
+    WHERE h.command_text LIKE '%MODIFY%SERVICE_OBJECTIVE%'
+      AND h.event_timestamp >= DATEADD(day, -{days_back}, GETDATE())
+) AS scale_logs
+"""
+
+print(f"--- 🛰️ PARSING LIVE AZURE FABRIC SCALING TIMELINES ---")
 
 token = mssparkutils.credentials.getToken("DW")
-synapse_sql_endpoint = "synw-synpeacx.sql.azuresynapse.net"
-calculated_uptime_hours = {}
+master_jdbc_url = "jdbc:sqlserver://synw-synpeacx.sql.azuresynapse.net:1433;database=master"
 
-# 1. RESILIENT CHECKING PASS
-for p_name, hourly_rate in dedicated_hourly_rates.items():
-    if v_pool_select != "All" and v_pool_select != p_name:
-        continue
-        
-    jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={p_name};loginTimeout=3;"
+try:
+    # Read the historical scale commands directly from the master control plane
+    raw_scale_df = spark.read.format("jdbc") \
+                        .option("url", master_jdbc_url) \
+                        .option("dbtable", scale_history_query) \
+                        .option("accessToken", token).load()
+                        
+    # Parse out the target DWU string from the raw SQL command text using regex
+    # Example string parsed: "ALTER DATABASE MyPool MODIFY (SERVICE_OBJECTIVE = 'DW500c')" -> Extracts "500"
+    parsed_scale_df = raw_scale_df.withColumn(
+        "ExtractedDWU", 
+        F.regexp_extract(F.col("Command"), r"SERVICE_OBJECTIVE\s*=\s*'DW(\d+)c'", 1).cast("double")
+    ).fillna(100.0, subset=["ExtractedDWU"]) # Default to base DW100c if unparsed
     
-    # We query a basic internal catalog table to verify if the engine is awake and responding
-    check_active_query = "(SELECT TOP 1 OBJECT_ID FROM sys.objects) AS active_test"
-    
-    try:
-        # Test connection status rapidly
-        test_df = spark.read.format("jdbc") \
-                    .option("url", jdbc_url) \
-                    .option("dbtable", check_active_query) \
-                    .option("accessToken", token) \
-                    .load()
-        
-        # If the query succeeds, the pool is completely online and active
-        calculated_uptime_hours[p_name] = hours_window
-    except Exception as e:
-        # If it catches an exception (Database paused/unavailable), it logs it as 0 hours
-        # without breaking the loops for your other running databases!
-        calculated_uptime_hours[p_name] = 0.0
-
-# 2. OUTPUT CLEAN INFRASTRUCTURE ACCOUNTING STATEMENT
-print("=" * 85)
-print("             💰 TRUE FIXED INFRASTRUCTURE ACCOUNTING METRICS ")
-print("=" * 85)
-print(f"{'Dedicated Pool Name':<45} | {'Status':<12} | {'Active Hours':<12} | {'True Fixed Cost':<15}")
-print("-" * 85)
-
-total_workspace_fixed_cost = 0.0
-for p_name, active_hours in calculated_uptime_hours.items():
-    rate = dedicated_hourly_rates[p_name]
-    pool_cost = rate * active_hours
-    total_workspace_fixed_cost += pool_cost
-    
-    status_string = "ONLINE" if active_hours > 0 else "PAUSED/OFF"
-    print(f"{p_name:<45} | {status_string:<12} | {int(active_hours):>2} / {int(hours_window):>2} hrs | ${pool_cost:<13,.2f}")
-
-print("-" * 85)
-print(f" 🔥 TOTAL ACCUMULATED FIXED COMPUTE CAPACITY LIABILITY: ${total_workspace_fixed_cost:,.2f}")
-print("=" * 85)
+    parsed_scale_df.cache()
+    print(" -> Successfully mapped workspace resource modification timelines.")
+except Exception as e:
+    print(f" -> [System Note] Master scale telemetry unavailable. Falling back to base configurations.")
+    parsed_scale_df = None
