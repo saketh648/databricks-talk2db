@@ -1,9 +1,6 @@
-import logging
+# Check if the Synapse Log Analytics emitter is active
+enabled = spark.conf.get("spark.synapse.logAnalytics.enabled", "false")
+workspace_id = spark.conf.get("spark.synapse.logAnalytics.workspaceId", "Not Found")
 
-# Set up the logger
-logger = logging.getLogger("SynapseSparkLogger")
-logger.setLevel(logging.INFO)
-
-# Log messages
-logger.info("Spark job successfully started!")
-logger.warning("This is a test warning sent to Log Analytics.")
+print(f"Log Analytics Enabled: {enabled}")
+print(f"Target Workspace ID:  {workspace_id}")
