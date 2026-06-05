@@ -1,15 +1,12 @@
-import os
+# Print out all loaded Spark configurations related to loganalytics
+conf_list = spark.sparkContext.getConf().getAll()
+la_configs = [c for c in conf_list if "logAnalytics" in c[0]]
 
-# Define the local path where Spark drivers output their diagnostic logs
-log_dir = "/var/log/spark/"
-if os.path.exists(log_dir):
-    print("Checking internal logs for Log Analytics errors...\n")
-    for file in os.listdir(log_dir):
-        if "driver" in file or "log" in file:
-            with open(os.path.join(log_dir, file), "r") as f:
-                for line in f:
-                    # Search for key Log Analytics initializations or errors
-                    if "LogAnalytics" in line or "workspace" in line.lower():
-                        print(line.strip())
+if la_configs:
+    print("--- Loaded Log Analytics Configurations ---")
+    for key, value in la_configs:
+        # Masking the secret for security
+        display_val = "********" if "secret" in key else value
+        print(f"{key}: {display_val}")
 else:
-    print("Log directory not accessible from this worker context.")
+    print("❌ WARNING: No Log Analytics configurations were found on this active session!")
