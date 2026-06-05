@@ -1,12 +1,5 @@
-# Print out all loaded Spark configurations related to loganalytics
-conf_list = spark.sparkContext.getConf().getAll()
-la_configs = [c for c in conf_list if "logAnalytics" in c[0]]
-
-if la_configs:
-    print("--- Loaded Log Analytics Configurations ---")
-    for key, value in la_configs:
-        # Masking the secret for security
-        display_val = "********" if "secret" in key else value
-        print(f"{key}: {display_val}")
-else:
-    print("❌ WARNING: No Log Analytics configurations were found on this active session!")
+{
+  "sku": {
+    "name": "DW200c"
+  }
+}
