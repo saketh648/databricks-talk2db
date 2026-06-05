@@ -1,9 +1,9 @@
-https://management.azure.com/subscriptions/241f8112-4687-4490-aa9f-b513a83ea434/resourceGroups/rg-cus-syndvecx-dev-01/providers/Microsoft.Sql/servers/synw-syndvecx/databases/wcib_dedicated?api-version=2021-11-01
+import logging
 
+# Set up the logger
+logger = logging.getLogger("SynapseSparkLogger")
+logger.setLevel(logging.INFO)
 
-
-{
-  "sku": {
-    "name": "DW100c"
-  }
-}
+# Log messages
+logger.info("Spark job successfully started!")
+logger.warning("This is a test warning sent to Log Analytics.")
