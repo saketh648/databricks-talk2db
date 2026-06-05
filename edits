@@ -1,6 +1,15 @@
-# Check if the Synapse Log Analytics emitter is active
-enabled = spark.conf.get("spark.synapse.logAnalytics.enabled", "false")
-workspace_id = spark.conf.get("spark.synapse.logAnalytics.workspaceId", "Not Found")
+import os
 
-print(f"Log Analytics Enabled: {enabled}")
-print(f"Target Workspace ID:  {workspace_id}")
+# Define the local path where Spark drivers output their diagnostic logs
+log_dir = "/var/log/spark/"
+if os.path.exists(log_dir):
+    print("Checking internal logs for Log Analytics errors...\n")
+    for file in os.listdir(log_dir):
+        if "driver" in file or "log" in file:
+            with open(os.path.join(log_dir, file), "r") as f:
+                for line in f:
+                    # Search for key Log Analytics initializations or errors
+                    if "LogAnalytics" in line or "workspace" in line.lower():
+                        print(line.strip())
+else:
+    print("Log directory not accessible from this worker context.")
