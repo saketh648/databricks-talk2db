@@ -263,51 +263,50 @@ final_dashboard_df = (
     .orderBy(F.col("SubmitTime").desc())
 )
 
-# Summary metrics
-total_queries     = final_dashboard_df.count()
-avg_exec_time     = final_dashboard_df.select(F.avg("DurationSec")).collect()[0][0] or 0.0
-has_serverless    = final_dashboard_df.filter(F.col("PoolType") == "Serverless").count()  > 0
-has_dedicated     = final_dashboard_df.filter(F.col("PoolType") == "Dedicated").count()  > 0
+total_queries  = final_dashboard_df.count()
+avg_exec_time  = final_dashboard_df.select(F.avg("DurationSec")).collect()[0][0] or 0.0
+has_serverless = final_dashboard_df.filter(F.col("PoolType") == "Serverless").count() > 0
+has_dedicated  = final_dashboard_df.filter(F.col("PoolType") == "Dedicated").count()  > 0
 
 print("=" * 85)
-print(f" 📊 METRICS CANVAS | USER: {v_user.upper()} | STATUS FILTER: {v_status.upper()} ")
+print(f" 📊 METRICS CANVAS | USER: {v_user.upper()} | STATUS: {v_status.upper()} ")
 print("=" * 85)
-print(f" -> Total Query Volume        : {total_queries}")
-print(f" -> Avg Execution Time        : {round(avg_exec_time, 2)} sec")
+print(f" -> Total Queries       : {total_queries}")
+print(f" -> Avg Execution Time  : {round(avg_exec_time, 2)} sec")
 
 if has_serverless and not has_dedicated:
     total_cost    = final_dashboard_df.select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
     total_scanned = final_dashboard_df.select(F.sum("DataProcessedGB")).collect()[0][0]  or 0.0
-    print(f" -> Data Scanned              : {round(total_scanned, 3)} GB")
-    print(f" 💸 Estimated Cost            : ${round(float(total_cost), 4)}")
+    print(f" -> Data Scanned        : {round(total_scanned, 4)} GB")
+    print(f" 💸 Estimated Cost      : ${total_cost:.6f}")          # plain decimal, never sci notation
 elif has_dedicated and not has_serverless:
     peak = final_dashboard_df.select(F.max("DurationSec")).collect()[0][0] or 0
-    print(f" 🚀 Peak Query Runtime        : {peak} sec")
-    print(f" [Note] Dedicated pools are flat-billed — no per-query cost.")
+    print(f" 🚀 Peak Query Runtime  : {peak} sec")
+    print(f" [Note] Dedicated pools are flat-billed.")
 else:
-    cost = final_dashboard_df.filter(F.col("PoolType") == "Serverless").select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0
-    print(f" 💸 Serverless Cost (blended) : ${round(float(cost), 4)}")
+    cost = (final_dashboard_df.filter(F.col("PoolType") == "Serverless")
+            .select(F.sum("EstimatedCostUSD")).collect()[0][0] or 0.0)
+    print(f" 💸 Serverless Cost     : ${cost:.6f}")
     print(f" [Info] Mixed view — isolate a pool for precise metrics.")
 
 print("=" * 85 + "\n")
 
-# --- COLUMN STRATEGY: drop cost columns for dedicated-only, keep for serverless/mixed ---
-# For QueryText: Spark's display() truncates by default — we force full text via a workaround
-# by converting to pandas for rendering (only viable if row count is reasonable)
-
-display_cols = ["ReqId", "UserIdentity", "SubmitTime", "DurationSec", "QueryText", "Status", "PoolType", "PoolName", "TeamName"]
-
+# Build display columns — cost cols only when serverless data present
+display_cols = ["ReqId", "UserIdentity", "SubmitTime", "DurationSec",
+                "QueryText", "Status", "PoolType", "PoolName"]
 if has_serverless:
     display_cols += ["DataProcessedGB", "EstimatedCostUSD"]
 
-# Truncate QueryText to 2000 chars so the cell renders cleanly without losing substance
+# Force full QueryText rendering — no mid-string truncation
+spark.conf.set("spark.sql.repl.eagerEval.truncate", "0")
+
 output_df = (
     final_dashboard_df
-    .withColumn("QueryText", F.substring(F.col("QueryText"), 1, 2000))
-    .select(*display_cols)
-)
-
-# Full text display fix: set Spark SQL display truncation off for this cell
-spark.conf.set("spark.sql.repl.eagerEval.truncate", "2000")
+    .withColumn(
+        # Format cost as plain decimal string so display never reverts to sci notation
+        "EstimatedCostUSD",
+        F.format_number(F.col("EstimatedCostUSD"), 6)
+    ) if has_serverless else final_dashboard_df
+).select(*display_cols)
 
 display(output_df)
