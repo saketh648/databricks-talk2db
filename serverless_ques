@@ -1,121 +1,3 @@
-from pyspark.sql import functions as F
-from pyspark.sql.types import *
-import ipywidgets as widgets
-from IPython.display import display as ipydisplay
-from datetime import datetime, timedelta, timezone
-
-spark.conf.set("spark.sql.debug.maxToStringFields", "5000")
-
-# --- CAPTURE VALUES FROM CELL 1 ---
-v_name = pool_name_w.value
-v_time = time_filter_w.value
-
-days_lookback = 1; hours_lookback = 0
-if v_time == "Past 1 Hour":    days_lookback = 0; hours_lookback = 1
-elif v_time == "Past 4 Hours": days_lookback = 0; hours_lookback = 4
-elif v_time == "Past 3 Days":  days_lookback = 3; hours_lookback = 0
-
-print(f"🚀 Initializing Extraction -> Pool={v_name} | Lookback={v_time}...\n")
-
-# --- AUTH + ENDPOINT ---
-token = mssparkutils.credentials.getToken("DW")
-synapse_sql_endpoint = "synw-synpeacx.sql.azuresynapse.net"
-
-teams_config = [
-    {"team": "Care Team",                "pool": "Care_dev_dedicated"},
-    {"team": "Operations Team",          "pool": "ac_operations__dev_dedicated_new"},
-    {"team": "WCIB Corporate Team",      "pool": "wcib_dev_dedicated"},
-    {"team": "Operations Team",          "pool": "operations_and_enterprise_prod_dedicated"},
-    {"team": "Marketing Data Team",      "pool": "marketing_data_products_prod_dedicated"},
-    {"team": "Marketing Act Team",       "pool": "marketing_activation_dev_dedicated"},
-    {"team": "Special Projects Team",    "pool": "special_projects__dev_dedicated"},
-    {"team": "Operations Team",          "pool": "operations_and_enterprise_dev_dedicated"},
-    {"team": "Marketing Analyt Team",    "pool": "marketing_analytics__prod_dedicated"},
-    {"team": "Care Team",                "pool": "care_prod_dedicated"},
-    {"team": "Digital Product Team",     "pool": "digital_prod_dedicated"},
-    {"team": "Marketing Analyt Team",    "pool": "marketing_analytics_dev_dedicated"},
-    {"team": "Digital Product Team",     "pool": "digital_dev_dedicated"},
-    {"team": "Location Analyt Team",     "pool": "locations_analytics_prod_dedicated"},
-    {"team": "WCIB Corporate Team",      "pool": "wcib_prod_dedicated"}
-]
-
-# --- SCHEMA ---
-schema_template = StructType([
-    StructField("ReqId",            StringType(),    True),
-    StructField("UserIdentity",     StringType(),    True),
-    StructField("SubmitTime",       TimestampType(), True),
-    StructField("DurationSec",      LongType(),      True),
-    StructField("QueryText",        StringType(),    True),
-    StructField("Status",           StringType(),    True),
-    StructField("PoolType",         StringType(),    True),
-    StructField("PoolName",         StringType(),    True),
-    StructField("DataProcessedGB",  DoubleType(),    True),
-    StructField("EstimatedCostUSD", DoubleType(),    True)
-])
-
-# ============================================================
-# PHASE A: DEDICATED POOLS — JDBC DMV PULL
-# ============================================================
-dedicated_dmv_query = f"""
-(
-    SELECT
-        r.request_id                                AS ReqId,
-        s.login_name                                AS UserIdentity,
-        r.submit_time                               AS SubmitTime,
-        DATEDIFF(second, r.start_time, r.end_time)  AS DurationSec,
-        r.command                                   AS QueryText,
-        r.status                                    AS Status
-    FROM sys.dm_pdw_exec_requests r
-    JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
-    WHERE r.start_time >= DATEADD(
-        {'hour' if hours_lookback > 0 else 'day'},
-        -{hours_lookback if hours_lookback > 0 else days_lookback},
-        GETDATE()
-    )
-) AS logs
-"""
-
-dedicated_dfs = []
-is_dedicated_scope = v_name == "All" or (
-    "dedicated" in v_name.lower() and v_name != "Built-in (Serverless)"
-)
-
-if is_dedicated_scope:
-    for cfg in teams_config:
-        if v_name != "All" and v_name != cfg["pool"]:
-            continue
-        jdbc_url = (
-            f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;"
-            f"database={cfg['pool']};loginTimeout=5;"
-        )
-        print(f" -> Accessing DMVs: {cfg['pool']}...")
-        try:
-            tmp_df = (
-                spark.read.format("jdbc")
-                .option("url", jdbc_url)
-                .option("dbtable", dedicated_dmv_query)
-                .option("accessToken", token)
-                .option("fetchsize", 100)
-                .option("truncate", "false")
-                .load()
-                .withColumn("PoolName",         F.lit(cfg["pool"]))
-                .withColumn("PoolType",         F.lit("Dedicated"))
-                .withColumn("DataProcessedGB",  F.lit(None).cast(DoubleType()))
-                .withColumn("EstimatedCostUSD", F.lit(None).cast(DoubleType()))
-                .select(
-                    "ReqId", "UserIdentity", "SubmitTime", "DurationSec",
-                    "QueryText", "Status", "PoolType", "PoolName",
-                    "DataProcessedGB", "EstimatedCostUSD"
-                )
-            )
-            dedicated_dfs.append(tmp_df)
-        except:
-            pass
-
-master_dedicated_df = dedicated_dfs[0] if dedicated_dfs else spark.createDataFrame([], schema_template)
-for next_df in dedicated_dfs[1:]:
-    master_dedicated_df = master_dedicated_df.unionByName(next_df)
-
 # ============================================================
 # PHASE B: SERVERLESS — RAW ADLS JSON LOG INGESTION
 # ============================================================
@@ -125,69 +7,26 @@ is_serverless_scope = v_name in ("All", "Built-in (Serverless)")
 if is_serverless_scope:
     print(" -> Scanning Serverless ADLS JSON Log Path...")
     try:
-        base_prefix = (
+        base_storage_path = (
             "abfss://insights-logs-builtinsqlreqsended"
             "@sasdlc1zpii01psynpeacx02.dfs.core.windows.net"
             "/resourceId=/SUBSCRIPTIONS/0A03E58F-29BD-4793-988F-F25C58CC7E1E"
             "/RESOURCEGROUPS/RG-CUS-SYNPEACX-PROD-01"
             "/PROVIDERS/MICROSOFT.SYNAPSE"
             "/WORKSPACES/SYNW-SYNPEACX"
+            "/y=*/m=*/d=*/h=*/m=*/PT1H.json"
         )
 
-        # Build targeted date partition paths instead of full wildcard glob
-        num_days = max(days_lookback, 1) if hours_lookback == 0 else 1
-        date_paths = []
-        for i in range(num_days + 1):
-            d = datetime.now(timezone.utc) - timedelta(days=i)
-            date_paths.append(
-                f"{base_prefix}/y={d.year}/m={d.month:02d}/d={d.day:02d}/h=*/m=*/PT1H.json"
-            )
+        # Read exactly like your old query — full glob, no options
+        raw_storage_df = spark.read.json(base_storage_path)
 
-        print(f"    Scanning {len(date_paths)} day partition(s): "
-              f"{[p.split('SYNW-SYNPEACX/')[1] for p in date_paths]}")
-
-        raw_storage_df = (
-            spark.read
-            .option("multiline", "true")
-            .json(date_paths)
-        )
-
-        # ---- DEBUG BLOCK: shows you exact schema + sample identity/queryText values ----
-        # Uncomment ONLY if users are still missing, then re-comment after
-        # print("\n--- RAW SCHEMA ---")
-        # raw_storage_df.printSchema()
-        # print("\n--- SAMPLE IDENTITY + QUERYTEXT ---")
-        # raw_storage_df.select("identity", "properties.queryText", "properties.startTime").show(5, truncate=False)
-        # ---------------------------------------------------------------------------------
-
+        # Time filter using the lookback window
         cutoff_expr = (
             f"current_timestamp() - INTERVAL {hours_lookback} HOURS"
             if hours_lookback > 0 else
             f"current_timestamp() - INTERVAL {days_lookback} DAYS"
         )
 
-        # Safely resolve identity — handle both struct and plain string layouts
-        # If identity is a struct with loginName inside:  identity.loginName
-        # If identity is a plain string (email/UPN directly): identity
-        # The coalesce below tries both so it works regardless
-        identity_col = F.coalesce(
-            F.col("identity.loginName"),
-            F.col("identity.login"),
-            F.col("identity").cast(StringType())
-        )
-
-        query_text_col = F.coalesce(
-            F.trim(F.col("properties.queryText")),
-            F.lit("MALFORMED SCRIPT / INSTANT PARSE FAILURE")
-        )
-
-        data_bytes_col = F.coalesce(
-            F.col("properties.dataProcessedBytes").cast(LongType()),
-            F.lit(0).cast(LongType())
-        )
-
-        # Apply time filter ONLY on startTime — do NOT filter on identity or status here
-        # so we get every row in the window and let Cell 3 dropdowns do the slicing
         filtered_raw = raw_storage_df.filter(
             F.col("properties.startTime").cast(TimestampType()) >= F.expr(cutoff_expr)
         )
@@ -199,8 +38,10 @@ if is_serverless_scope:
             filtered_raw
             .select(
                 F.col("properties.clientRequestId").alias("ReqId"),
-                identity_col.alias("UserIdentity"),
+                F.col("identity.loginName").alias("UserIdentity"),
                 F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
+
+                # Duration null-safe
                 F.when(
                     F.col("properties.endTime").isNull() | F.col("properties.startTime").isNull(),
                     F.lit(0)
@@ -208,19 +49,28 @@ if is_serverless_scope:
                     F.unix_timestamp(F.col("properties.endTime").cast(TimestampType()))
                     - F.unix_timestamp(F.col("properties.startTime").cast(TimestampType()))
                 ).cast(LongType()).alias("DurationSec"),
-                query_text_col.alias("QueryText"),
+
+                # Use properties.command exactly like your old query
+                F.coalesce(
+                    F.trim(F.col("properties.command")),
+                    F.lit("MALFORMED SCRIPT / INSTANT PARSE FAILURE")
+                ).alias("QueryText"),
+
                 F.when(
                     F.col("properties.error").isNotNull(), F.lit("Failed")
                 ).otherwise(F.lit("Completed")).alias("Status"),
-                F.round(
-                    data_bytes_col / (1024.0 * 1024.0 * 1024.0), 4
-                ).alias("DataProcessedGB"),
+
+                F.col("properties.dataProcessedBytes").cast(LongType()).alias("Bytes")
+            )
+            .withColumn("PoolType", F.lit("Serverless"))
+            .withColumn("PoolName", F.lit("Built-in (Serverless)"))
+            .withColumn("DataProcessedGB",
+                F.round(F.col("Bytes") / (1024.0 * 1024.0 * 1024.0), 3)
             )
             .withColumn("EstimatedCostUSD",
                 F.round(F.col("DataProcessedGB") * 0.0048828, 6)
             )
-            .withColumn("PoolType", F.lit("Serverless"))
-            .withColumn("PoolName", F.lit("Built-in (Serverless)"))
+            .drop("Bytes")
             .select(
                 "ReqId", "UserIdentity", "SubmitTime", "DurationSec",
                 "QueryText", "Status", "PoolType", "PoolName",
@@ -233,37 +83,3 @@ if is_serverless_scope:
 
     except Exception as e:
         print(f"    [Note] Serverless ADLS path unavailable or empty: {e}")
-
-# ============================================================
-# PHASE C: UNION + POOL NAME FILTER + CACHE
-# ============================================================
-raw_master_df = master_dedicated_df.unionByName(master_serverless_df)
-
-base_filtered_df = raw_master_df.filter(
-    F.col("PoolName").isin([v_name]) if v_name != "All" else F.lit(True)
-)
-
-base_filtered_df.cache()
-
-# --- BUILD USER + STATUS DROPDOWNS FOR CELL 3 ---
-unique_users = sorted([
-    row["UserIdentity"]
-    for row in base_filtered_df.select("UserIdentity").distinct().collect()
-    if row["UserIdentity"]
-])
-unique_users.insert(0, "All")
-
-user_filter_w = widgets.Dropdown(
-    options=unique_users,
-    value="All",
-    description="View User:"
-)
-status_filter_w = widgets.Dropdown(
-    options=["All", "Completed", "Failed", "Running"],
-    value="All",
-    description="Query Status:"
-)
-
-print(f"\n--- ✅ Data Cached! {len(unique_users)-1} unique users found. ---")
-ipydisplay(user_filter_w)
-ipydisplay(status_filter_w)
