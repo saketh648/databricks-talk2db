@@ -136,9 +136,6 @@ if is_serverless_scope:
 
         raw_storage_df = spark.read.json(base_storage_path)
 
-        # Uncomment to find correct query text field — paste output and I'll fix it
-        # raw_storage_df.select("properties.*").printSchema()
-
         cutoff_expr = (
             f"current_timestamp() - INTERVAL {hours_lookback} HOURS"
             if hours_lookback > 0 else
@@ -155,9 +152,17 @@ if is_serverless_scope:
         master_serverless_df = (
             filtered_raw
             .select(
-                F.col("properties.clientRequestId").alias("ReqId"),
+                # ReqId — distributedStatementId is populated, clientRequestId is often null
+                F.coalesce(
+                    F.col("properties.distributedStatementId"),
+                    F.col("properties.clientRequestId"),
+                    F.lit("N/A")
+                ).alias("ReqId"),
+
                 F.col("identity.loginName").alias("UserIdentity"),
                 F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
+
+                # Duration null-safe
                 F.when(
                     F.col("properties.endTime").isNull() | F.col("properties.startTime").isNull(),
                     F.lit(0)
@@ -165,18 +170,21 @@ if is_serverless_scope:
                     F.unix_timestamp(F.col("properties.endTime").cast(TimestampType()))
                     - F.unix_timestamp(F.col("properties.startTime").cast(TimestampType()))
                 ).cast(LongType()).alias("DurationSec"),
-                # Using properties.command same as your old working query
-                # If this still returns one word, uncomment printSchema above
-                # and share output so we can find the full text field
-                F.coalesce(
-										F.trim(F.col("properties.queryText")),
-								    F.trim(F.col("properties.command")),
-								    F.lit("QUERY TEXT UNAVAILABLE")
-								).alias("QueryText"),
 
+                # Full query text — queryText has full SQL, command only has first word
+                F.coalesce(
+                    F.trim(F.col("properties.queryText")),
+                    F.trim(F.col("properties.command")),
+                    F.lit("QUERY TEXT UNAVAILABLE")
+                ).alias("QueryText"),
+
+                # Status — empty string treated same as null, only real errors = Failed
                 F.when(
-                    F.col("properties.error").isNotNull(), F.lit("Failed")
+                    F.col("properties.error").isNotNull() &
+                    (F.trim(F.col("properties.error")) != ""),
+                    F.lit("Failed")
                 ).otherwise(F.lit("Completed")).alias("Status"),
+
                 F.col("properties.dataProcessedBytes").cast(LongType()).alias("Bytes")
             )
             .withColumn("PoolType", F.lit("Serverless"))
