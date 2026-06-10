@@ -46,7 +46,7 @@ from IPython.display import display as ipydisplay
 
 spark.conf.set("spark.sql.debug.maxToStringFields", "5000")
 
-# Capture values
+# --- CAPTURE VALUES FROM CELL 1 ---
 v_name = pool_name_w.value
 v_time = time_filter_w.value
 
@@ -57,6 +57,7 @@ elif v_time == "Past 3 Days":  days_lookback = 3; hours_lookback = 0
 
 print(f"🚀 Initializing Extraction -> Pool={v_name} | Lookback={v_time}...\n")
 
+# --- AUTH + ENDPOINT ---
 token = mssparkutils.credentials.getToken("DW")
 synapse_sql_endpoint = "synw-synpeacx.sql.azuresynapse.net"
 
@@ -78,6 +79,7 @@ teams_config = [
     {"team": "WCIB Corporate Team",      "pool": "wcib_prod_dedicated"}
 ]
 
+# --- SCHEMA (no TeamName) ---
 schema_template = StructType([
     StructField("ReqId",            StringType(),    True),
     StructField("UserIdentity",     StringType(),    True),
@@ -87,21 +89,22 @@ schema_template = StructType([
     StructField("Status",           StringType(),    True),
     StructField("PoolType",         StringType(),    True),
     StructField("PoolName",         StringType(),    True),
-    StructField("TeamName",         StringType(),    True),
     StructField("DataProcessedGB",  DoubleType(),    True),
     StructField("EstimatedCostUSD", DoubleType(),    True)
 ])
 
-# --- PHASE A: DEDICATED POOLS ---
+# ============================================================
+# PHASE A: DEDICATED POOLS — JDBC DMV PULL
+# ============================================================
 dedicated_dmv_query = f"""
 (
-    SELECT 
-        r.request_id                                        AS ReqId,
-        s.login_name                                        AS UserIdentity,
-        r.submit_time                                       AS SubmitTime,
-        DATEDIFF(second, r.start_time, r.end_time)          AS DurationSec,
-        r.command                                           AS QueryText,
-        r.status                                            AS Status
+    SELECT
+        r.request_id                                AS ReqId,
+        s.login_name                                AS UserIdentity,
+        r.submit_time                               AS SubmitTime,
+        DATEDIFF(second, r.start_time, r.end_time)  AS DurationSec,
+        r.command                                   AS QueryText,
+        r.status                                    AS Status
     FROM sys.dm_pdw_exec_requests r
     JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
     WHERE r.start_time >= DATEADD(
@@ -113,34 +116,49 @@ dedicated_dmv_query = f"""
 """
 
 dedicated_dfs = []
-is_dedicated_scope = v_name == "All" or ("dedicated" in v_name.lower() and v_name != "Built-in (Serverless)")
+is_dedicated_scope = v_name == "All" or (
+    "dedicated" in v_name.lower() and v_name != "Built-in (Serverless)"
+)
 
 if is_dedicated_scope:
     for cfg in teams_config:
         if v_name != "All" and v_name != cfg["pool"]:
             continue
-        jdbc_url = f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;database={cfg['pool']};loginTimeout=5;"
+        jdbc_url = (
+            f"jdbc:sqlserver://{synapse_sql_endpoint}:1433;"
+            f"database={cfg['pool']};loginTimeout=5;"
+        )
         print(f" -> Accessing DMVs: {cfg['pool']}...")
         try:
-            tmp_df = (spark.read.format("jdbc")
-                      .option("url", jdbc_url)
-                      .option("dbtable", dedicated_dmv_query)
-                      .option("accessToken", token)
-                      .load()
-                      .withColumn("TeamName",         F.lit(cfg["team"]))
-                      .withColumn("PoolName",         F.lit(cfg["pool"]))
-                      .withColumn("PoolType",         F.lit("Dedicated"))
-                      .withColumn("DataProcessedGB",  F.lit(None).cast(DoubleType()))   # NULL — not applicable
-                      .withColumn("EstimatedCostUSD", F.lit(None).cast(DoubleType())))  # NULL — flat billed
+            tmp_df = (
+                spark.read.format("jdbc")
+                .option("url", jdbc_url)
+                .option("dbtable", dedicated_dmv_query)
+                .option("accessToken", token)
+                .option("fetchsize", 100)
+                .option("truncate", "false")
+                .load()
+                .withColumn("PoolName",         F.lit(cfg["pool"]))
+                .withColumn("PoolType",         F.lit("Dedicated"))
+                .withColumn("DataProcessedGB",  F.lit(None).cast(DoubleType()))
+                .withColumn("EstimatedCostUSD", F.lit(None).cast(DoubleType()))
+                .select(
+                    "ReqId", "UserIdentity", "SubmitTime", "DurationSec",
+                    "QueryText", "Status", "PoolType", "PoolName",
+                    "DataProcessedGB", "EstimatedCostUSD"
+                )
+            )
             dedicated_dfs.append(tmp_df)
         except:
-            pass
+            pass  # Pool offline/paused — skip silently
 
 master_dedicated_df = dedicated_dfs[0] if dedicated_dfs else spark.createDataFrame([], schema_template)
 for next_df in dedicated_dfs[1:]:
     master_dedicated_df = master_dedicated_df.unionByName(next_df)
 
-# --- PHASE B: SERVERLESS — RAW ADLS JSON LOG INGESTION ---
+# ============================================================
+# PHASE B: SERVERLESS — RAW ADLS JSON LOG INGESTION
+# ============================================================
 master_serverless_df = spark.createDataFrame([], schema_template)
 is_serverless_scope = v_name in ("All", "Built-in (Serverless)")
 
@@ -157,12 +175,29 @@ if is_serverless_scope:
             "/y=*/m=*/d=*/h=*/m=*/PT1H.json"
         )
 
-        raw_storage_df = spark.read.json(base_storage_path)
+        raw_storage_df = spark.read.option("multiline", "true").json(base_storage_path)
 
-        # Build a cutoff timestamp from the lookback window for partition pruning
-        cutoff_expr = f"current_timestamp() - INTERVAL {hours_lookback} HOURS" \
-                      if hours_lookback > 0 else \
-                      f"current_timestamp() - INTERVAL {days_lookback} DAYS"
+        # DEBUG — uncomment if QueryText still comes as one word, then re-comment
+        # raw_storage_df.printSchema()
+        # raw_storage_df.select("properties.command", "properties.commandText").show(3, truncate=False)
+
+        cutoff_expr = (
+            f"current_timestamp() - INTERVAL {hours_lookback} HOURS"
+            if hours_lookback > 0 else
+            f"current_timestamp() - INTERVAL {days_lookback} DAYS"
+        )
+
+        # Handle both older (command) and newer (commandText) Synapse log schemas
+        query_text_col = F.coalesce(
+            F.trim(F.col("properties.commandText")),
+            F.trim(F.col("properties.command")),
+            F.lit("MALFORMED SCRIPT / INSTANT PARSE FAILURE")
+        )
+
+        data_bytes_col = F.coalesce(
+            F.col("properties.dataProcessedBytes").cast(LongType()),
+            F.lit(0).cast(LongType())
+        )
 
         master_serverless_df = (
             raw_storage_df
@@ -173,8 +208,6 @@ if is_serverless_scope:
                 F.col("properties.clientRequestId").alias("ReqId"),
                 F.col("identity.loginName").alias("UserIdentity"),
                 F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
-
-                # Duration: null-safe subtraction
                 F.when(
                     F.col("properties.endTime").isNull() | F.col("properties.startTime").isNull(),
                     F.lit(0)
@@ -182,43 +215,33 @@ if is_serverless_scope:
                     F.unix_timestamp(F.col("properties.endTime").cast(TimestampType()))
                     - F.unix_timestamp(F.col("properties.startTime").cast(TimestampType()))
                 ).cast(LongType()).alias("DurationSec"),
-
-                F.coalesce(
-                    F.trim(F.col("properties.command")),
-                    F.lit("MALFORMED SCRIPT / INSTANT PARSE FAILURE")
-                ).alias("QueryText"),
-
-                # Derive status from presence of error node
+                query_text_col.alias("QueryText"),
                 F.when(
                     F.col("properties.error").isNotNull(), F.lit("Failed")
                 ).otherwise(F.lit("Completed")).alias("Status"),
-
-                # Cost columns — convert bytes to GB then price
                 F.round(
-                    F.col("properties.dataProcessedBytes").cast(LongType()) / (1024*1024*1024), 3
+                    data_bytes_col / (1024.0 * 1024.0 * 1024.0), 4
                 ).alias("DataProcessedGB"),
             )
             .withColumn("EstimatedCostUSD",
-                F.round(F.col("DataProcessedGB") * 0.0048828, 4)
+                F.round(F.col("DataProcessedGB") * 0.0048828, 6)
             )
-            .withColumn("PoolType",  F.lit("Serverless"))
-            .withColumn("PoolName",  F.lit("Built-in (Serverless)"))
-            .withColumn("TeamName",  F.lit("Shared Infrastructure"))
+            .withColumn("PoolType", F.lit("Serverless"))
+            .withColumn("PoolName", F.lit("Built-in (Serverless)"))
+            .select(
+                "ReqId", "UserIdentity", "SubmitTime", "DurationSec",
+                "QueryText", "Status", "PoolType", "PoolName",
+                "DataProcessedGB", "EstimatedCostUSD"
+            )
         )
-
-        # Cast to schema_template column order for clean unionByName with dedicated
-        master_serverless_df = master_serverless_df.select(
-            "ReqId", "UserIdentity", "SubmitTime", "DurationSec",
-            "QueryText", "Status", "PoolType", "PoolName", "TeamName",
-            "DataProcessedGB", "EstimatedCostUSD"
-        )
-
-        print(f"    [OK] Serverless logs loaded from ADLS path.")
+        print("    [OK] Serverless logs loaded from ADLS path.")
 
     except Exception as e:
         print(f"    [Note] Serverless ADLS path unavailable or empty: {e}")
 
-# --- PHASE C: UNION + FILTER (no status filter here — moved to Cell 3) ---
+# ============================================================
+# PHASE C: UNION + POOL NAME FILTER + CACHE
+# ============================================================
 raw_master_df = master_dedicated_df.unionByName(master_serverless_df)
 
 base_filtered_df = raw_master_df.filter(
@@ -227,6 +250,7 @@ base_filtered_df = raw_master_df.filter(
 
 base_filtered_df.cache()
 
+# --- BUILD USER + STATUS DROPDOWNS FOR CELL 3 ---
 unique_users = sorted([
     row["UserIdentity"]
     for row in base_filtered_df.select("UserIdentity").distinct().collect()
@@ -234,7 +258,11 @@ unique_users = sorted([
 ])
 unique_users.insert(0, "All")
 
-user_filter_w   = widgets.Dropdown(options=unique_users, value="All", description="View User:")
+user_filter_w = widgets.Dropdown(
+    options=unique_users,
+    value="All",
+    description="View User:"
+)
 status_filter_w = widgets.Dropdown(
     options=["All", "Completed", "Failed", "Running"],
     value="All",
