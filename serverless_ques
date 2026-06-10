@@ -169,9 +169,11 @@ if is_serverless_scope:
                 # If this still returns one word, uncomment printSchema above
                 # and share output so we can find the full text field
                 F.coalesce(
-                    F.trim(F.col("properties.command")),
-                    F.lit("QUERY TEXT UNAVAILABLE")
-                ).alias("QueryText"),
+										F.trim(F.col("properties.queryText")),
+								    F.trim(F.col("properties.command")),
+								    F.lit("QUERY TEXT UNAVAILABLE")
+								).alias("QueryText"),
+
                 F.when(
                     F.col("properties.error").isNotNull(), F.lit("Failed")
                 ).otherwise(F.lit("Completed")).alias("Status"),
