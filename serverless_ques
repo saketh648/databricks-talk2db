@@ -1,4 +1,4 @@
-lfrom pyspark.sql import functions as F
+from pyspark.sql import functions as F
 from pyspark.sql.types import *
 import ipywidgets as widgets
 from IPython.display import display as ipydisplay
@@ -21,21 +21,21 @@ token = mssparkutils.credentials.getToken("DW")
 synapse_sql_endpoint = "synw-synpeacx.sql.azuresynapse.net"
 
 teams_config = [
-    {"team": "Care Team",                "pool": "Care_dev_dedicated"},
-    {"team": "Operations Team",          "pool": "ac_operations__dev_dedicated_new"},
-    {"team": "WCIB Corporate Team",      "pool": "wcib_dev_dedicated"},
-    {"team": "Operations Team",          "pool": "operations_and_enterprise_prod_dedicated"},
-    {"team": "Marketing Data Team",      "pool": "marketing_data_products_prod_dedicated"},
-    {"team": "Marketing Act Team",       "pool": "marketing_activation_dev_dedicated"},
-    {"team": "Special Projects Team",    "pool": "special_projects__dev_dedicated"},
-    {"team": "Operations Team",          "pool": "operations_and_enterprise_dev_dedicated"},
-    {"team": "Marketing Analyt Team",    "pool": "marketing_analytics__prod_dedicated"},
-    {"team": "Care Team",                "pool": "care_prod_dedicated"},
-    {"team": "Digital Product Team",     "pool": "digital_prod_dedicated"},
-    {"team": "Marketing Analyt Team",    "pool": "marketing_analytics_dev_dedicated"},
-    {"team": "Digital Product Team",     "pool": "digital_dev_dedicated"},
-    {"team": "Location Analyt Team",     "pool": "locations_analytics_prod_dedicated"},
-    {"team": "WCIB Corporate Team",      "pool": "wcib_prod_dedicated"}
+    {"pool": "Care_dev_dedicated"},
+    {"pool": "ac_operations__dev_dedicated_new"},
+    {"pool": "wcib_dev_dedicated"},
+    {"pool": "operations_and_enterprise_prod_dedicated"},
+    {"pool": "marketing_data_products_prod_dedicated"},
+    {"pool": "marketing_activation_dev_dedicated"},
+    {"pool": "special_projects__dev_dedicated"},
+    {"pool": "operations_and_enterprise_dev_dedicated"},
+    {"pool": "marketing_analytics__prod_dedicated"},
+    {"pool": "care_prod_dedicated"},
+    {"pool": "digital_prod_dedicated"},
+    {"pool": "marketing_analytics_dev_dedicated"},
+    {"pool": "digital_dev_dedicated"},
+    {"pool": "locations_analytics_prod_dedicated"},
+    {"pool": "wcib_prod_dedicated"}
 ]
 
 # --- SCHEMA ---
@@ -136,7 +136,7 @@ if is_serverless_scope:
 
         raw_storage_df = spark.read.json(base_storage_path)
 
-        # DEBUG — uncomment to find correct full query text field name, then re-comment
+        # Uncomment to find correct query text field — paste output and I'll fix it
         # raw_storage_df.select("properties.*").printSchema()
 
         cutoff_expr = (
@@ -152,23 +152,6 @@ if is_serverless_scope:
         row_count = filtered_raw.count()
         print(f"    Raw rows in time window: {row_count}")
 
-        # Try all known full-query field names — whichever is non-null wins
-        query_text_col = F.coalesce(
-            F.when(
-                F.length(F.trim(F.col("properties.queryText"))) > 10,
-                F.trim(F.col("properties.queryText"))
-            ),
-            F.when(
-                F.length(F.trim(F.col("properties.statementText"))) > 10,
-                F.trim(F.col("properties.statementText"))
-            ),
-            F.when(
-                F.length(F.trim(F.col("properties.command"))) > 10,
-                F.trim(F.col("properties.command"))
-            ),
-            F.lit("QUERY TEXT UNAVAILABLE IN LOG")
-        )
-
         master_serverless_df = (
             filtered_raw
             .select(
@@ -182,7 +165,13 @@ if is_serverless_scope:
                     F.unix_timestamp(F.col("properties.endTime").cast(TimestampType()))
                     - F.unix_timestamp(F.col("properties.startTime").cast(TimestampType()))
                 ).cast(LongType()).alias("DurationSec"),
-                query_text_col.alias("QueryText"),
+                # Using properties.command same as your old working query
+                # If this still returns one word, uncomment printSchema above
+                # and share output so we can find the full text field
+                F.coalesce(
+                    F.trim(F.col("properties.command")),
+                    F.lit("QUERY TEXT UNAVAILABLE")
+                ).alias("QueryText"),
                 F.when(
                     F.col("properties.error").isNotNull(), F.lit("Failed")
                 ).otherwise(F.lit("Completed")).alias("Status"),
