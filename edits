@@ -1,12 +1,22 @@
-# Print out all loaded Spark configurations related to loganalytics
-conf_list = spark.sparkContext.getConf().getAll()
-la_configs = [c for c in conf_list if "logAnalytics" in c[0]]
-
-if la_configs:
-    print("--- Loaded Log Analytics Configurations ---")
-    for key, value in la_configs:
-        # Masking the secret for security
-        display_val = "********" if "secret" in key else value
-        print(f"{key}: {display_val}")
-else:
-    print("❌ WARNING: No Log Analytics configurations were found on this active session!")
+        # 4. FIXED SERVERLESS BLOCK WITH FULL SCRIPT RETRIEVAL & DURATION SAFETY
+        master_serverless_df = serverless_raw.select(
+            F.col("RequestId").alias("ReqId"), 
+            F.col("Identity").alias("UserIdentity"), 
+            F.col("StartTime").alias("SubmitTime"),
+            
+            # FIX 1: Prevent "undefined" by ensuring we handle null/matching timestamps cleanly
+            F.when(
+                F.col("EndTime").isNull() | F.col("StartTime").isNull() | (F.col("EndTime") == F.col("StartTime")), 
+                F.lit(0)
+            ).otherwise(
+                F.unix_timestamp("EndTime") - F.unix_timestamp("StartTime")
+            ).cast(LongType()).alias("DurationSec"), 
+            
+            # FIX 2: Clean white spaces and grab full command text string safely
+            F.coalesce(F.trim(F.col("QueryText")), F.lit("MALFORMED SCRIPT / PARSE ERROR")).alias("QueryText"), 
+            F.col("Status")
+        ).withColumn("PoolType", F.lit("Serverless"))\
+         .withColumn("PoolName", F.lit("Built-in (Serverless)"))\
+         .withColumn("TeamName", F.lit("Shared Infrastructure"))\
+         .withColumn("DataProcessedGB", F.round(F.col("dataProcessedBytes_d") / (1024*1024*1024), 3))\
+         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4))
