@@ -1,62 +1,46 @@
-{
-"fileName": "@{pipeline().parameters.FileName}",
-"emailTo": "your-email@domain.com",
-"fileContent": {
-"$content-type": "application/octet-stream",
-"$content": "@{base64(activity('GetFileContent').output)}"
-}
-}
+        # Correct field names from your actual schema
+        query_text_col = F.coalesce(
+            F.trim(F.col("properties.queryText")),
+            F.lit("MALFORMED SCRIPT / INSTANT PARSE FAILURE")
+        )
 
+        data_bytes_col = F.coalesce(
+            F.col("properties.dataProcessedBytes").cast(LongType()),
+            F.lit(0).cast(LongType())
+        )
 
-
-
-
-{
-    "fileName": "test.csv",
-    "emailTo": "user@example.com",
-    "fileContent": {
-        "$content-type": "application/octet-stream",
-        "$content": "base64string"
-    }
-}
-
-
-
-triggerBody()?['fileContent']?['$content']
-
-
-triggerBody()?['fileContent']?['$content']
-
-
-
-{
-    "fileName": "@{pipeline().parameters.FileName}",
-    "emailTo": "your-email@u-s-bank.com",
-    "fileContent": {
-        "$content": "@{activity('GetFileContent').output.Response}"
-    }
-}
-
-
-
-{
-    "fileName": "@{pipeline().parameters.FileName}",
-    "emailTo": "saisakethreddy.lingala@usbank.com",
-    "fileContent": {
-        "$content": "@{activity('GetFileContent').output.Response}"
-    }
-}
-
-
-
-
-
-{
-    "fileName": "@{pipeline().parameters.FileName}",
-    "emailTo": "saisakethreddy.lingala@usbank.com",
-    "fileContent": {
-        "$content": "@{base64(activity('GetFileContent').output.Response)}"
-    }
-}
-
-
+        master_serverless_df = (
+            raw_storage_df
+            .filter(
+                F.col("properties.startTime").cast(TimestampType()) >= F.expr(cutoff_expr)
+            )
+            .select(
+                F.col("properties.clientRequestId").alias("ReqId"),
+                F.col("identity.loginName").alias("UserIdentity"),
+                F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
+                F.when(
+                    F.col("properties.endTime").isNull() | F.col("properties.startTime").isNull(),
+                    F.lit(0)
+                ).otherwise(
+                    F.unix_timestamp(F.col("properties.endTime").cast(TimestampType()))
+                    - F.unix_timestamp(F.col("properties.startTime").cast(TimestampType()))
+                ).cast(LongType()).alias("DurationSec"),
+                query_text_col.alias("QueryText"),
+                F.when(
+                    F.col("properties.error").isNotNull(), F.lit("Failed")
+                ).otherwise(F.lit("Completed")).alias("Status"),
+                F.round(
+                    data_bytes_col / (1024.0 * 1024.0 * 1024.0), 4
+                ).alias("DataProcessedGB"),
+            )
+            .withColumn("EstimatedCostUSD",
+                F.round(F.col("DataProcessedGB") * 0.0048828, 6)
+            )
+            .withColumn("PoolType", F.lit("Serverless"))
+            .withColumn("PoolName", F.lit("Built-in (Serverless)"))
+            .select(
+                "ReqId", "UserIdentity", "SubmitTime", "DurationSec",
+                "QueryText", "Status", "PoolType", "PoolName",
+                "DataProcessedGB", "EstimatedCostUSD"
+            )
+        )
