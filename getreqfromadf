@@ -140,40 +140,83 @@ master_dedicated_df = dedicated_dfs[0] if dedicated_dfs else spark.createDataFra
 for next_df in dedicated_dfs[1:]:
     master_dedicated_df = master_dedicated_df.unionByName(next_df)
 
-# --- PHASE B: SERVERLESS ---
+# --- PHASE B: SERVERLESS — RAW ADLS JSON LOG INGESTION ---
 master_serverless_df = spark.createDataFrame([], schema_template)
-is_serverless_scope = v_name in ("All", "Built-in (Serverless)") or "serverless" in v_name.lower()
+is_serverless_scope = v_name in ("All", "Built-in (Serverless)")
 
 if is_serverless_scope:
-    print(" -> Scanning Serverless Log Registry Table...")
+    print(" -> Scanning Serverless ADLS JSON Log Path...")
     try:
-        serverless_lookback = (
-            '1h'  if v_time == 'Past 1 Hour'   else
-            '4h'  if v_time == 'Past 4 Hours'  else
-            '1d'  if v_time == 'Past 24 Hours' else '3d'
+        base_storage_path = (
+            "abfss://insights-logs-builtinsqlreqsended"
+            "@sasdlc1zpii01psynpeacx02.dfs.core.windows.net"
+            "/resourceId=/SUBSCRIPTIONS/0A03E58F-29BD-4793-988F-F25C58CC7E1E"
+            "/RESOURCEGROUPS/RG-CUS-SYNPEACX-PROD-01"
+            "/PROVIDERS/MICROSOFT.SYNAPSE"
+            "/WORKSPACES/SYNW-SYNPEACX"
+            "/y=*/m=*/d=*/h=*/m=*/PT1H.json"
         )
-        serverless_raw = (spark.read.table("SynapseBuiltinSqlPoolRequestsEnded")
-                          .filter(f"StartTime >= ago({serverless_lookback})"))
 
-        master_serverless_df = (serverless_raw.select(
-            F.col("RequestId").alias("ReqId"),
-            F.col("Identity").alias("UserIdentity"),
-            F.col("StartTime").alias("SubmitTime"),
-            F.when(
-                F.col("EndTime").isNull() | F.col("StartTime").isNull() | (F.col("EndTime") == F.col("StartTime")),
-                F.lit(0)
-            ).otherwise(
-                F.unix_timestamp("EndTime") - F.unix_timestamp("StartTime")
-            ).cast(LongType()).alias("DurationSec"),
-            F.coalesce(F.trim(F.col("QueryText")), F.lit("MALFORMED SCRIPT / INSTANT PARSE FAILURE")).alias("QueryText"),
-            F.col("Status")
-        ).withColumn("PoolType",         F.lit("Serverless"))
-         .withColumn("PoolName",         F.lit("Built-in (Serverless)"))
-         .withColumn("TeamName",         F.lit("Shared Infrastructure"))
-         .withColumn("DataProcessedGB",  F.round(F.col("dataProcessedBytes_d") / (1024*1024*1024), 3))
-         .withColumn("EstimatedCostUSD", F.round(F.col("DataProcessedGB") * 0.0048828, 4)))
+        raw_storage_df = spark.read.json(base_storage_path)
+
+        # Build a cutoff timestamp from the lookback window for partition pruning
+        cutoff_expr = f"current_timestamp() - INTERVAL {hours_lookback} HOURS" \
+                      if hours_lookback > 0 else \
+                      f"current_timestamp() - INTERVAL {days_lookback} DAYS"
+
+        master_serverless_df = (
+            raw_storage_df
+            .filter(
+                F.col("properties.startTime").cast(TimestampType()) >= F.expr(cutoff_expr)
+            )
+            .select(
+                F.col("properties.clientRequestId").alias("ReqId"),
+                F.col("identity.loginName").alias("UserIdentity"),
+                F.col("properties.startTime").cast(TimestampType()).alias("SubmitTime"),
+
+                # Duration: null-safe subtraction
+                F.when(
+                    F.col("properties.endTime").isNull() | F.col("properties.startTime").isNull(),
+                    F.lit(0)
+                ).otherwise(
+                    F.unix_timestamp(F.col("properties.endTime").cast(TimestampType()))
+                    - F.unix_timestamp(F.col("properties.startTime").cast(TimestampType()))
+                ).cast(LongType()).alias("DurationSec"),
+
+                F.coalesce(
+                    F.trim(F.col("properties.command")),
+                    F.lit("MALFORMED SCRIPT / INSTANT PARSE FAILURE")
+                ).alias("QueryText"),
+
+                # Derive status from presence of error node
+                F.when(
+                    F.col("properties.error").isNotNull(), F.lit("Failed")
+                ).otherwise(F.lit("Completed")).alias("Status"),
+
+                # Cost columns — convert bytes to GB then price
+                F.round(
+                    F.col("properties.dataProcessedBytes").cast(LongType()) / (1024*1024*1024), 3
+                ).alias("DataProcessedGB"),
+            )
+            .withColumn("EstimatedCostUSD",
+                F.round(F.col("DataProcessedGB") * 0.0048828, 4)
+            )
+            .withColumn("PoolType",  F.lit("Serverless"))
+            .withColumn("PoolName",  F.lit("Built-in (Serverless)"))
+            .withColumn("TeamName",  F.lit("Shared Infrastructure"))
+        )
+
+        # Cast to schema_template column order for clean unionByName with dedicated
+        master_serverless_df = master_serverless_df.select(
+            "ReqId", "UserIdentity", "SubmitTime", "DurationSec",
+            "QueryText", "Status", "PoolType", "PoolName", "TeamName",
+            "DataProcessedGB", "EstimatedCostUSD"
+        )
+
+        print(f"    [OK] Serverless logs loaded from ADLS path.")
+
     except Exception as e:
-        print(f"    [Note] Serverless table empty or unavailable: {e}")
+        print(f"    [Note] Serverless ADLS path unavailable or empty: {e}")
 
 # --- PHASE C: UNION + FILTER (no status filter here — moved to Cell 3) ---
 raw_master_df = master_dedicated_df.unionByName(master_serverless_df)
