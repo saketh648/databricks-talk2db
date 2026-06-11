@@ -1,22 +1,7 @@
-from pyspark.sql import functions as F
-from pyspark.sql.types import *
-
-raw_storage_df = spark.read.json(
-    "abfss://insights-logs-builtinsqlreqsended"
-    "@sasdlc1zpii01psynpeacx02.dfs.core.windows.net"
-    "/resourceId=/SUBSCRIPTIONS/0A03E58F-29BD-4793-988F-F25C58CC7E1E"
-    "/RESOURCEGROUPS/RG-CUS-SYNPEACX-PROD-01"
-    "/PROVIDERS/MICROSOFT.SYNAPSE"
-    "/WORKSPACES/SYNW-SYNPEACX"
-    "/y=*/m=*/d=*/h=*/m=*/PT1H.json"
+.withColumn("DataProcessedGB",
+    F.round(F.col("Bytes") / (1024.0 * 1024.0 * 1024.0), 6)  # 6 decimal places instead of 3
 )
-
-raw_storage_df.select(
-    "properties.queryText",
-    "properties.dataProcessedBytes"
-).filter(
-    F.col("properties.dataProcessedBytes").isNotNull() &
-    (F.col("properties.dataProcessedBytes") > 0)
-).orderBy(
-    F.col("properties.dataProcessedBytes").desc()
-).show(20, truncate=50)
+.withColumn("EstimatedCostUSD",
+    # Azure Serverless pricing is $5 per TB scanned = $0.004882 per GB
+    F.round((F.col("Bytes") / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.0, 6)  # price per TB not GB
+)
