@@ -1,61 +1,44 @@
-dedicated_dmv_query = f"""
-(
-    SELECT
-        r.request_id                                        AS ReqId,
-        s.login_name                                        AS UserIdentity,
-        r.submit_time                                       AS SubmitTime,
-        CASE
-            WHEN r.start_time IS NULL THEN 0.0
-            WHEN r.end_time IS NULL   THEN CAST(DATEDIFF(millisecond, r.start_time, GETDATE()) AS FLOAT) / 1000.0
-            ELSE                           CAST(r.total_elapsed_time AS FLOAT) / 1000.0
-        END                                                 AS DurationSec,
-        r.command                                           AS QueryText,
-        r.status                                            AS Status
-    FROM sys.dm_pdw_exec_requests r
-    JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
-    WHERE r.start_time >= DATEADD(
-        {'hour' if hours_lookback > 0 else 'day'},
-        -{hours_lookback if hours_lookback > 0 else days_lookback},
-        GETDATE()
+import json
+from databricks.vector_search.client import VectorSearchClient
+
+def quer_vector_db(query_text):
+    vsc = VectorSearchClient()
+    
+    endpoint_name = "talk2db_poc_endpoint"
+    index_fullname = "dev.er_sp_metadata.spg_entity_master_index"
+    
+    # 1. Grab specific index reference
+    index = vsc.get_index(endpoint_name=endpoint_name, index_name=index_fullname)
+    
+    # 2. Corrected parameter name: endpoint_name
+    active_indexes = vsc.list_indexes(endpoint_name=endpoint_name)
+    
+    print("--- Active Endpoint Indexes Payload ---")
+    print(json.dumps(active_indexes, indent=2))
+    print("---------------------------------------\n")
+    
+    # 3. Safe iteration loop over vector_indexes list
+    for idx in active_indexes.get('vector_indexes', []):
+        print(f"Name: {idx.get('name')}")
+        
+        # Safely extract status structure blocks
+        status_info = idx.get('status', {})
+        is_ready = status_info.get('ready', False)
+        row_count = status_info.get('num_indexed_rows', 0)
+        
+        print(f"Index Ready: {is_ready}")
+        print(f"Row Count: {row_count}\n---")
+        
+    # 4. Perform Similarity Search
+    print(f"Running similarity search for: '{query_text}'")
+    results = index.similarity_search(
+        query_text=query_text,
+        columns=["childcompanyname"],
+        num_results=3
     )
-) AS logs
-"""
+    
+    return results
 
-
-
-
-
-schema_template = StructType([
-    StructField("ReqId",            StringType(),    True),
-    StructField("UserIdentity",     StringType(),    True),
-    StructField("SubmitTime",       TimestampType(), True),
-    StructField("DurationSec",      DoubleType(),    True),  # changed from LongType
-    StructField("QueryText",        StringType(),    True),
-    StructField("Status",           StringType(),    True),
-    StructField("PoolType",         StringType(),    True),
-    StructField("PoolName",         StringType(),    True),
-    StructField("DataProcessedGB",  DoubleType(),    True),
-    StructField("EstimatedCostUSD", DoubleType(),    True)
-])
-
-
-
-
-).cast(DoubleType()).alias("DurationSec"),
-
-
-
-
-# Store as string so it never shows scientific notation in display
-.withColumn("EstimatedCostUSD",
-    F.format_number(
-        F.round((F.col("Bytes") / (1024.0 * 1024.0 * 1024.0 * 1024.0)) * 5.0, 8),
-        8
-    )
-)
-
-
-
-
-
-StructField("EstimatedCostUSD", StringType(), True),
+# Test run execution
+search_results = quer_vector_db("target")
+print(json.dumps(search_results, indent=2))
