@@ -4,11 +4,11 @@ dedicated_dmv_query = f"""
         r.request_id                                AS ReqId,
         s.login_name                                AS UserIdentity,
         r.submit_time                               AS SubmitTime,
-        CASE 
-            WHEN r.end_time IS NULL OR r.start_time IS NULL 
-                THEN DATEDIFF(second, r.start_time, GETDATE())
-            WHEN r.end_time = r.start_time 
+        CASE
+            WHEN r.start_time IS NULL
                 THEN 0
+            WHEN r.end_time IS NULL
+                THEN DATEDIFF(second, r.start_time, GETDATE())
             ELSE DATEDIFF(second, r.start_time, r.end_time)
         END                                         AS DurationSec,
         r.command                                   AS QueryText,
