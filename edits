@@ -1,44 +1,4 @@
-import json
-from databricks.vector_search.client import VectorSearchClient
-
-def quer_vector_db(query_text):
-    vsc = VectorSearchClient()
-    
-    endpoint_name = "talk2db_poc_endpoint"
-    index_fullname = "dev.er_sp_metadata.spg_entity_master_index"
-    
-    # 1. Grab specific index reference
-    index = vsc.get_index(endpoint_name=endpoint_name, index_name=index_fullname)
-    
-    # 2. Corrected parameter name: endpoint_name
-    active_indexes = vsc.list_indexes(endpoint_name=endpoint_name)
-    
-    print("--- Active Endpoint Indexes Payload ---")
-    print(json.dumps(active_indexes, indent=2))
-    print("---------------------------------------\n")
-    
-    # 3. Safe iteration loop over vector_indexes list
-    for idx in active_indexes.get('vector_indexes', []):
-        print(f"Name: {idx.get('name')}")
-        
-        # Safely extract status structure blocks
-        status_info = idx.get('status', {})
-        is_ready = status_info.get('ready', False)
-        row_count = status_info.get('num_indexed_rows', 0)
-        
-        print(f"Index Ready: {is_ready}")
-        print(f"Row Count: {row_count}\n---")
-        
-    # 4. Perform Similarity Search
-    print(f"Running similarity search for: '{query_text}'")
-    results = index.similarity_search(
-        query_text=query_text,
-        columns=["childcompanyname"],
-        num_results=3
-    )
-    
-    return results
-
-# Test run execution
-search_results = quer_vector_db("target")
-print(json.dumps(search_results, indent=2))
+# Check the deep status payload
+desc = index.describe()
+print(f"Status State: {desc.get('status', {}).get('state')}")
+print(f"Message: {desc.get('status', {}).get('message')}")
