@@ -1,3 +1,6 @@
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+
 raw_storage_df = spark.read.json(
     "abfss://insights-logs-builtinsqlreqsended"
     "@sasdlc1zpii01psynpeacx02.dfs.core.windows.net"
@@ -8,11 +11,12 @@ raw_storage_df = spark.read.json(
     "/y=*/m=*/d=*/h=*/m=*/PT1H.json"
 )
 
-# Show raw byte values alongside the query so we can see what unit it actually is
 raw_storage_df.select(
     "properties.queryText",
     "properties.dataProcessedBytes"
 ).filter(
     F.col("properties.dataProcessedBytes").isNotNull() &
     (F.col("properties.dataProcessedBytes") > 0)
-).orderBy(F.col("properties.dataProcessedBytes").desc()).show(20, truncate=50)
+).orderBy(
+    F.col("properties.dataProcessedBytes").desc()
+).show(20, truncate=50)
