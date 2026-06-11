@@ -1,15 +1,14 @@
-# Truncate QueryText to 8000 chars at Spark level
-# — enough for any real query, prevents the Jackson 20MB error,
-# and forces Synapse Results tab to show full text per cell
 output_df = (
     final_dashboard_df
     .select(*display_cols)
-    .withColumn("QueryText", 
-        F.substring(F.col("QueryText"), 1, 8000)
+    .withColumn("QueryText",
+        F.concat(
+            F.lit("<div style='white-space:pre-wrap; max-width:600px; font-family:monospace; font-size:11px;'>"),
+            F.substring(F.col("QueryText"), 1, 8000),
+            F.lit("</div>")
+        )
     )
 )
 
-# This config tells Synapse Results tab not to truncate string columns
 spark.conf.set("spark.sql.repl.eagerEval.truncate", "8000")
-
 display(output_df)
