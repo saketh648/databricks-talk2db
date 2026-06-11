@@ -1,24 +1,27 @@
-dedicated_dmv_query = f"""
+token = mssparkutils.credentials.getToken("DW")
+
+diag_query = """
 (
-    SELECT
-        r.request_id                                AS ReqId,
-        s.login_name                                AS UserIdentity,
-        r.submit_time                               AS SubmitTime,
-        CASE
-            WHEN r.start_time IS NULL
-                THEN 0
-            WHEN r.end_time IS NULL
-                THEN DATEDIFF(second, r.start_time, GETDATE())
-            ELSE DATEDIFF(second, r.start_time, r.end_time)
-        END                                         AS DurationSec,
-        r.command                                   AS QueryText,
-        r.status                                    AS Status
+    SELECT TOP 20
+        r.request_id,
+        r.start_time,
+        r.end_time,
+        r.submit_time,
+        r.status,
+        DATEDIFF(second, r.start_time, r.end_time) AS calc_duration,
+        r.total_elapsed_time
     FROM sys.dm_pdw_exec_requests r
-    JOIN sys.dm_pdw_exec_sessions s ON r.session_id = s.session_id
-    WHERE r.start_time >= DATEADD(
-        {'hour' if hours_lookback > 0 else 'day'},
-        -{hours_lookback if hours_lookback > 0 else days_lookback},
-        GETDATE()
-    )
-) AS logs
+    WHERE r.start_time IS NOT NULL
+    ORDER BY r.submit_time DESC
+) AS diag
 """
+
+diag_df = (
+    spark.read.format("jdbc")
+    .option("url", "jdbc:sqlserver://synw-synpeacx.sql.azuresynapse.net:1433;database=Care_dev_dedicated;loginTimeout=5;")
+    .option("dbtable", diag_query)
+    .option("accessToken", token)
+    .load()
+)
+
+diag_df.show(20, truncate=False)
