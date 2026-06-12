@@ -1,4 +1,50 @@
-# Check the deep status payload
-desc = index.describe()
-print(f"Status State: {desc.get('status', {}).get('state')}")
-print(f"Message: {desc.get('status', {}).get('message')}")
+import java.sql.DriverManager as DriverManager
+
+def load_monthly_to_table(aod_c):
+    # 1. Fetch paths from your existing helper function
+    parquet_stage_abfss, _ = get_monthly_stage_paths(aod_c)
+    
+    # 2. Read the source parquet files into a DataFrame
+    df = spark.read.parquet(parquet_stage_abfss)
+    
+    # 3. Fetch token for authentication
+    access_token = mssparkutils.credentials.getToken("DW")
+    
+    # 4. Define your ADLS Gen2 staging folder path 
+    # (This is where Spark will temporarily dump data for the Dedicated Pool to bulk-load)
+    staging_folder = "abfss://<your-container>@<your-storage-account>.dfs.core.windows.net/<your-staging-folder-path>"
+    
+    print(f"Starting bulk load into Dedicated Pool via Synapse Connector for date: {aod_c}...")
+    
+    # 5. Optimized Bulk Write using the Synapse native connector
+    (
+        df.write
+        .format("com.microsoft.spark.sqlanalytics")
+        .option("synapseStore", "true") 
+        .option("url", jdbc_url_write)
+        .option("dbtable", "dgsa_gold.balance_flow_monthly")
+        .option("accessToken", access_token)
+        .option("stagingStorageFolder", staging_folder)
+        .mode("append")
+        .save()
+    )
+    
+    print("Bulk load write complete. Fetching inserted row count...")
+
+    # 6. Optimized Count Check using the specialized Microsoft Spark SQL driver
+    inserted_rows = (
+        spark.read
+        .format("com.microsoft.sqlserver.jdbc.spark")
+        .option("url", jdbc_url_write)
+        .option("accessToken", access_token)
+        .option("query", f"""
+            SELECT COUNT(*) AS cnt 
+            FROM dgsa_gold.balance_flow_monthly 
+            WHERE as_of_dt = '{aod_c}'
+        """)
+        .load()
+        .collect()[0]["cnt"]
+    )
+    
+    print(f"Successfully processed. Total rows for {aod_c}: {inserted_rows}")
+    return inserted_rows
