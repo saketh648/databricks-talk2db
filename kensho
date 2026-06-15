@@ -1,27 +1,34 @@
-from databricks.vector_search.client import VectorSearchClient
+# 1. See what party_name_clean looks like vs party_id
+spark.sql("""
+    SELECT 
+        party_id,
+        party_name_clean,
+        sor_id,
+        spgid19
+    FROM dev.mma_entityresolution.tbl_entityres_ach_rec_names_match_kensho
+    LIMIT 20
+""").display()
 
+
+
+# 2. Check what columns exist in your source table
+spark.sql("""
+    DESCRIBE dev.mma_entityresolution.tbl_entityres_ach_rec_names_match_kensho
+""").display()
+
+
+# 3. Check what columns exist in your S&P index
+from databricks.vector_search.client import VectorSearchClient
 vsc = VectorSearchClient()
 index = vsc.get_index(
     endpoint_name="talk2db_poc_endpoint",
     index_name="dev.er_sp_metadata.spg_entity_master_index"
 )
+# Pull one result with all available columns to see what's there
+result = index.similarity_search(
+    query_text="Bank",
+    columns=["*"],  # or list every column name you know of
+    num_results=1
+)
+print(result)
 
-tests = {
-    "Horizons At Stonebridg": 29622020,
-    "Industrial Training":    608731212,
-    "Happy Garden":           566325189,
-    "Hampton Inn Nashville":  643897773,
-}
-
-for name, target_spgid in tests.items():
-    result = index.similarity_search(
-        query_text=name,
-        columns=["childcompanyname", "childcompanyid"],
-        num_results=5
-    )
-    rows = result.get("result", {}).get("data_array", [])
-    target_found = any(int(float(r[1])) == target_spgid for r in rows)
-    print(f"\n=== {name} (target={target_spgid}, in_results={target_found}) ===")
-    for r in rows:
-        marker = " ✅" if int(float(r[1])) == target_spgid else ""
-        print(f"  {r[0]} | id={int(float(r[1]))} | score={r[2]:.4f}{marker}")
