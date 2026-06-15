@@ -1,4 +1,3 @@
-# DIAGNOSTIC CELL - run this standalone, do NOT run the full pipeline yet
 from databricks.vector_search.client import VectorSearchClient
 
 vsc = VectorSearchClient()
@@ -7,16 +6,12 @@ index = vsc.get_index(
     index_name="dev.er_sp_metadata.spg_entity_master_index"
 )
 
-# Test with a known name from your data
 result = index.similarity_search(
     query_text="Us Bank",
-    columns=["childcompanyname", "childcompanyid", "spgid19"],
+    columns=["childcompanyname", "childcompanyid"],  # NO spgid19
     num_results=3
 )
 
-print("FULL RAW RESULT:")
-print(result)
-print()
 print("DATA ARRAY:")
 for i, row in enumerate(result.get("result", {}).get("data_array", [])):
     print(f"Row {i}: {row}")
