@@ -1,7 +1,5 @@
-import java.sql.DriverManager as DriverManager
-
 def load_monthly_to_table(aod_c):
-    # 1. Fetch paths from your existing helper function
+    # 1. Fetch paths from your helper function
     parquet_stage_abfss, _ = get_monthly_stage_paths(aod_c)
     
     # 2. Read the source parquet files into a DataFrame
@@ -10,32 +8,31 @@ def load_monthly_to_table(aod_c):
     # 3. Fetch token for authentication
     access_token = mssparkutils.credentials.getToken("DW")
     
-    # 4. Define your ADLS Gen2 staging folder path 
-    # (This is where Spark will temporarily dump data for the Dedicated Pool to bulk-load)
-    staging_folder = "abfss://<your-container>@<your-storage-account>.dfs.core.windows.net/<your-staging-folder-path>"
+    print(f"Starting optimized JDBC Bulk load into Dedicated Pool for date: {aod_c}...")
     
-    print(f"Starting bulk load into Dedicated Pool via Synapse Connector for date: {aod_c}...")
-    
-    # 5. Optimized Bulk Write using the Synapse native connector
+    # 4. Standard JDBC format but loaded with parameters to force bulk speed
     (
         df.write
-        .format("com.microsoft.spark.sqlanalytics")
-        .option("synapseStore", "true") 
+        .format("jdbc")                                                    # Safe standard format to avoid data source errors
         .option("url", jdbc_url_write)
         .option("dbtable", "dgsa_gold.balance_flow_monthly")
+        .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")    # Leverages your working driver
         .option("accessToken", access_token)
-        .option("stagingStorageFolder", staging_folder)
+        .option("isolationLevel", "NONE")                                  # Drops transactional logging overhead
+        .option("batchsize", "150000")                                     # Groups records into massive network flushes
+        .option("tableLock", "true")                                       # CRITICAL: Disables row-locks to allow direct bulk writes
         .mode("append")
         .save()
     )
     
     print("Bulk load write complete. Fetching inserted row count...")
 
-    # 6. Optimized Count Check using the specialized Microsoft Spark SQL driver
+    # 5. Fast Count Check using the exact same safe JDBC setup
     inserted_rows = (
         spark.read
-        .format("com.microsoft.sqlserver.jdbc.spark")
+        .format("jdbc")
         .option("url", jdbc_url_write)
+        .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
         .option("accessToken", access_token)
         .option("query", f"""
             SELECT COUNT(*) AS cnt 
