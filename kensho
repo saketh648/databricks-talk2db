@@ -1,22 +1,27 @@
-def build_prompt_column():
-    return F.concat_ws("",
-        F.lit("You are an enterprise entity resolution assistant matching ACH payment names to S&P master entities.\n\n"),
-        F.lit("RAW NAME: "),     F.col("name_clean"),
-        F.lit("\nCANDIDATES: "), F.col("candidates_json"),
-        F.lit(
-            "\n\nINSTRUCTIONS:\n"
-            "1. RAW NAME is from ACH payment data — it may be abbreviated or truncated.\n"
-            "2. From CANDIDATES, pick the entity that best represents the organization named in RAW NAME.\n"
-            "3. RANKING RULES — apply in order:\n"
-            "   a. If RAW NAME matches a parent/group/holding entity name, prefer it over subsidiaries or agencies.\n"
-            "   b. If RAW NAME words appear more completely in a candidate name, prefer that candidate.\n"
-            "   c. Do NOT blindly pick the highest score — scores reflect name similarity, not entity correctness.\n"
-            "   d. For water utilities, municipalities, government entities — prefer the most specific geographic match.\n"
-            "   e. For insurance companies — prefer the GROUP or parent entity over agencies or service centers.\n"
-            "4. Abbreviated names are valid matches (e.g. 'US Bank NA' → 'U.S. Bank, NA').\n"
-            "5. Only output UNMATCHED if no candidate is even remotely the same organization.\n"
-            "6. Extract the exact candidate name and its 'id' field from the JSON.\n\n"
-            "OUTPUT FORMAT — respond with exactly this structure and nothing else:\n"
-            "[MATCH]: <exact candidate name or UNMATCHED> | [MATCHED_ID]: <id value or BLANK> | [REASON]: <one sentence>"
-        )
+from databricks.vector_search.client import VectorSearchClient
+
+vsc = VectorSearchClient()
+index = vsc.get_index(
+    endpoint_name="talk2db_poc_endpoint",
+    index_name="dev.er_sp_metadata.spg_entity_master_index"
+)
+
+tests = {
+    "Horizons At Stonebridg": 29622020,
+    "Industrial Training":    608731212,
+    "Happy Garden":           566325189,
+    "Hampton Inn Nashville":  643897773,
+}
+
+for name, target_spgid in tests.items():
+    result = index.similarity_search(
+        query_text=name,
+        columns=["childcompanyname", "childcompanyid"],
+        num_results=5
     )
+    rows = result.get("result", {}).get("data_array", [])
+    target_found = any(int(float(r[1])) == target_spgid for r in rows)
+    print(f"\n=== {name} (target={target_spgid}, in_results={target_found}) ===")
+    for r in rows:
+        marker = " ✅" if int(float(r[1])) == target_spgid else ""
+        print(f"  {r[0]} | id={int(float(r[1]))} | score={r[2]:.4f}{marker}")
