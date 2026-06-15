@@ -153,4 +153,181 @@ def make_vector_worker(cfg: dict):
                     full_upper = name_clean.upper()
                     seen: dict = {}
 
-                    for data, weight in
+                    for data, weight in [(r1, 1.0), (r2, 0.95)]:
+                        for r in data:
+                            c_name  = str(r[0]).strip()   # childcompanyname
+                            c_id    = str(r[1]).strip()   # childcompanyid
+                            v_score = float(r[-1])        # Distance score
+
+                            if not is_valid_name(c_name, max_digit_frac):
+                                continue
+
+                            c_upper = c_name.upper()
+                            if kw_upper and kw_upper in c_upper:
+                                boost = boost_exact
+                            elif full_upper and full_upper in c_upper:
+                                boost = boost_partial
+                            elif kw_upper and c_upper in kw_upper:
+                                boost = boost_reverse
+                            else:
+                                boost = 1.0
+
+                            final_score = round(v_score * 100 * boost * weight, 2)
+
+                            if c_name not in seen or final_score > seen[c_name]["score"]:
+                                seen[c_name] = {"score": final_score, "id": c_id}
+
+                    processed = sorted(
+                        [{"name": n, "id": info["id"], "score": info["score"]} for n, info in seen.items()],
+                        key=lambda x: x["score"], reverse=True
+                    )[:5]
+
+                    top = processed[0] if processed else None
+
+                    results.append({
+                        "name_clean":         name_clean,
+                        "name_keyword":       name_keyword,
+                        "candidates_json":    json.dumps(processed),
+                        "raw_vector_score":   top["score"] if top else 0.0,
+                        "top_candidate_name": top["name"]  if top else "",
+                        "top_candidate_id":   top["id"]    if top else "",
+                    })
+
+                except Exception:
+                    results.append({
+                        "name_clean":         name_clean,
+                        "name_keyword":       name_keyword,
+                        "candidates_json":    "[]",
+                        "raw_vector_score":   0.0,
+                        "top_candidate_name": "",
+                        "top_candidate_id":   "",
+                    })
+            yield pd.DataFrame(results)
+    return worker
+
+# ============================================================
+# STEP 3: LLM PROMPT
+# ============================================================
+
+def build_prompt_column():
+    return F.concat_ws("",
+        F.lit("You are an enterprise data entity resolution bot.\n\n"),
+        F.lit("RAW NAME: "),     F.col("name_clean"),
+        F.lit("\nCANDIDATES: "), F.col("candidates_json"),
+        F.lit(
+            "\n\nINSTRUCTIONS:\n"
+            "1. Match the RAW NAME to the best legal candidate from the provided JSON array.\n"
+            "2. Extract both the exact corporate name and its corresponding 'id' value string.\n"
+            "3. If there are no matches that structurally fit, reply UNMATCHED for the name and leave the ID blank.\n\n"
+            "OUTPUT FORMAT ONLY:\n"
+            "[MATCH]: <legal entity name or UNMATCHED> | [MATCHED_ID]: <id value or BLANK> | [REASON]: <one sentence explanation>"
+        )
+    )
+
+# ============================================================
+# STEP 4: EXECUTION PIPELINE
+# ============================================================
+
+def run_pipeline(cfg: dict):
+    spark.catalog.clearCache()
+
+    # 4a. Run cleaning on sources
+    source_dfs = []
+    for src in cfg["sources"]:
+        df = normalize(
+            spark.table(src["table"]),
+            name_col=src["name_col"],
+            id_col=src["id_col"],
+            pass_through_cols=src["pass_through_cols"]
+        )
+        source_dfs.append((src, df))
+
+    # 4b. Registry Generation
+    all_dfs = [d for _, d in source_dfs]
+    search_registry = all_dfs[0].select("name_clean", "name_keyword")
+    if len(all_dfs) > 1:
+        for extra_df in all_dfs[1:]:
+            search_registry = search_registry.union(extra_df.select("name_clean", "name_keyword"))
+            
+    search_registry = search_registry.distinct().filter(
+        F.col("name_clean").isNotNull() & (F.length(F.trim(F.col("name_clean"))) >= cfg["min_name_length"])
+    )
+
+    # 4c. Vector Similarity Phase
+    vector_worker = make_vector_worker(cfg)
+    registry_matches = (
+        search_registry
+        .repartition(cfg["vector_partitions"])
+        .mapInPandas(vector_worker, schema=result_schema)
+        .cache()
+    )
+
+    # 4d. LLM Invocation
+    answer_key = (
+        registry_matches
+        .withColumn("prompt", build_prompt_column())
+        .repartition(cfg["llm_partitions"])
+        .withColumn(
+            "llm_raw",
+            F.expr(
+                f"ai_query('{cfg['llm_model']}', prompt, "
+                f"map('max_tokens', '{cfg['llm_max_tokens']}', 'temperature', '{cfg['llm_temperature']}'))"
+            )
+        )
+        .cache()
+    )
+
+    # 4e. Compiling + Writing Output
+    for src_meta, df_clean in source_dfs:
+        df_final = (
+            df_clean
+            .join(registry_matches, on="name_clean", how="left")
+            .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
+        )
+
+        # Extraction logic matching your token split targets
+        df_final = (
+            df_final
+            .withColumn("llm_name", F.trim(F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1), r"[\*\[\]\"']", "")))
+            .withColumn("llm_id",   F.trim(F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCHED_ID\]:\s*([^|]+)", 1), r"[\*\[\]\"']", "")))
+            .withColumn("match_explanation", F.trim(F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1)))
+        )
+
+        # Fallback evaluation mapping names and corporate IDs
+        df_final = df_final.withColumn(
+            "childcompanyname",
+            F.when(F.col("llm_name").isNotNull() & (F.upper(F.col("llm_name")) != "UNMATCHED"), F.col("llm_name"))
+             .when((F.col("raw_vector_score") >= cfg["score_fallback_min"]) & F.col("top_candidate_name").isNotNull(), F.col("top_candidate_name"))
+             .otherwise(F.lit("No Clear Match"))
+        ).withColumn(
+            "childcompanyid",
+            F.when(F.col("llm_name").isNotNull() & (F.upper(F.col("llm_name")) != "UNMATCHED"), F.col("llm_id"))
+             .when((F.col("raw_vector_score") >= cfg["score_fallback_min"]) & F.col("top_candidate_name").isNotNull(), F.col("top_candidate_id"))
+             .otherwise(F.lit(None).cast(StringType()))
+        )
+
+        # Structuring explicitly requested output schema
+        final_cols = [
+            "sor_id",
+            "src_company_name_raw",    # raw name
+            "name_clean",              # clean name
+            "childcompanyname",        # s&p company it matched
+            "childcompanyid",          # childcompanyid from vector search index payload
+            "spgid19",                 # spgid19 from your source table
+            "match_explanation"        # match explanation
+        ]
+
+        out_table = f"{cfg['output_database']}.{src_meta['output_table']}"
+        (
+            df_final.select(final_cols)
+            .write.format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .saveAsTable(out_table)
+        )
+        print(f"✅ Processed successfully -> Saved to Delta Table: {out_table}")
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+run_pipeline(CONFIG)
