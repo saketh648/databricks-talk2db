@@ -1,6 +1,8 @@
 # ============================================================
-# GENERIC ENTERPRISE ENTITY RESOLUTION PIPELINE - V3
-# Tailored for childcompanyid and spgid19 retention
+# GENERIC ENTERPRISE ENTITY RESOLUTION PIPELINE - V4
+# Fixes: spgid19 surfaced in candidates, raw score logging,
+#        stricter LLM prompt, boost inflation guard,
+#        truncation-aware fallback, diagnostic audit block
 # ============================================================
 
 import pandas as pd
@@ -17,7 +19,8 @@ CONFIG = {
     "vector_endpoint":      "talk2db_poc_endpoint",
     "vector_index":         "dev.er_sp_metadata.spg_entity_master_index",
     "vector_name_col":      "childcompanyname",   # Company name in S&P index
-    "vector_id_col":        "childcompanyid",     # The correct ID column in your S&P index
+    "vector_id_col":        "childcompanyid",     # ID column in S&P index
+    "vector_spgid_col":     "spgid19",            # NEW: also pull spgid19 from index for diagnostics
     "vector_top_k":         15,
 
     # LLM
@@ -26,82 +29,86 @@ CONFIG = {
     "llm_temperature":      0,
 
     # Scoring thresholds
-    "score_boost_exact":    1.4,
-    "score_boost_partial":  1.3,
-    "score_boost_reverse":  1.2,
-    "score_fallback_min":   90.0,
+    # NOTE: Boosts are multipliers — keep them conservative to avoid inflating weak matches
+    "score_boost_exact":    1.2,   # was 1.4 — reduced to avoid false confidence
+    "score_boost_partial":  1.1,   # was 1.3
+    "score_boost_reverse":  1.05,  # was 1.2
+    "score_fallback_min":   92.0,  # raw boosted score needed to trust vector fallback without LLM
 
     # Parallelism
     "vector_partitions":    60,
     "llm_partitions":       120,
 
-    # Sources: pointing to your target table
+    # Sources
     "sources": [
         {
-            "table":        "dev.mma_entityresolution.tbl_entityres_ach_rec_names_match_kensho",
-            "name_col":     "party_id",           # Column with the concatenated numeric + text string
-            "id_col":       "sor_id",             # Primary system key
-            "pass_through_cols": ["spgid19"],     # Carried over from your source table
-            "output_table": "entity_resolution_ach_received_kensho_resolved",
+            "table":             "dev.mma_entityresolution.tbl_entityres_ach_rec_names_match_kensho",
+            "name_col":          "party_id",
+            "id_col":            "sor_id",
+            "pass_through_cols": ["spgid19"],
+            "output_table":      "entity_resolution_ach_received_kensho_resolved",
         }
     ],
 
     "output_database": "dev.mma_entityresolution",
 
     # Regex to strip the long padded numbers out of the party_id string
-    "party_id_pattern":      r"^\d+[-\s]*(.*)$",
-    
-    # Standard legal suffix cleaning
-    "strip_prefix_pattern":  r"^(#[A-Z0-9]+\s+|[0-9]+[A-Z0-9]*\s+)",
-    "strip_suffix_pattern":  r"(?i)\b(LLC|INC|CORP|LTD|SERVICES|S\.P\.A|B\.V|K\.K|DEFAULT|APP|APPS|PLATFORM|PAYMENT|PAYMENTS|PAY)\b",
+    "party_id_pattern":     r"^\d+[-\s]*(.*)$",
 
-    "min_name_length": 2,
+    # Standard legal suffix / prefix cleaning
+    "strip_prefix_pattern": r"^(#[A-Z0-9]+\s+|[0-9]+[A-Z0-9]*\s+)",
+    "strip_suffix_pattern": r"(?i)\b(LLC|INC|CORP|LTD|SERVICES|S\.P\.A|B\.V|K\.K|DEFAULT|APP|APPS|PLATFORM|PAYMENT|PAYMENTS|PAY)\b",
+
+    "min_name_length":    2,
     "max_digit_fraction": 0.7,
 }
 
 # ============================================================
-# STEP 1: PARSING & CLEANING WORKER
+# STEP 1: PARSING & CLEANING
 # ============================================================
 
 def normalize(df, name_col, id_col, pass_through_cols):
-    # Ensure sor_id and your requested pass-through columns are explicitly preserved
     select_cols = [F.col(id_col).alias("sor_id")] + [F.col(c) for c in pass_through_cols]
-    
+
     return (
         df
         .withColumn("src_company_name_raw", F.col(name_col))
-        
-        # Isolate text from the numeric block
-        .withColumn("_raw_text_extracted", 
+
+        # Isolate text from numeric block
+        .withColumn("_raw_text_extracted",
             F.regexp_extract(F.col(name_col), CONFIG["party_id_pattern"], 1)
         )
-        .withColumn("_raw_text", 
-            F.when(F.col("_raw_text_extracted") == "", F.col(name_col)).otherwise(F.col("_raw_text_extracted"))
+        .withColumn("_raw_text",
+            F.when(F.col("_raw_text_extracted") == "", F.col(name_col))
+             .otherwise(F.col("_raw_text_extracted"))
         )
-        
-        # Clean background noise
-        .withColumn("_upper", F.upper(F.trim(F.col("_raw_text"))))
+
+        # Clean noise
+        .withColumn("_upper",    F.upper(F.trim(F.col("_raw_text"))))
         .withColumn("_stripped", F.trim(F.regexp_replace(F.col("_upper"), CONFIG["strip_prefix_pattern"], "")))
         .withColumn("_denoised", F.trim(F.regexp_replace(F.col("_stripped"), CONFIG["strip_suffix_pattern"], "")))
-        
-        # Return cleaned strings
-        .withColumn("name_clean", F.initcap(F.trim(F.col("_denoised"))))
+
+        # Final cleaned forms
+        .withColumn("name_clean",   F.initcap(F.trim(F.col("_denoised"))))
         .withColumn("name_keyword", F.initcap(F.trim(F.regexp_extract(F.col("_denoised"), r"^(\S+)", 1))))
-        
+
         .select(*select_cols, "src_company_name_raw", "name_clean", "name_keyword")
     )
 
 # ============================================================
-# STEP 2: VECTOR SEARCH WITH CHILDCOMPANYID EXTRACTION
+# STEP 2: VECTOR SEARCH
+# Now also pulls spgid19 from index for diagnostic transparency
+# Raw pre-boost scores are logged alongside final scores
 # ============================================================
 
 result_schema = StructType([
     StructField("name_clean",           StringType(), True),
     StructField("name_keyword",         StringType(), True),
-    StructField("candidates_json",      StringType(), True),
-    StructField("raw_vector_score",     FloatType(),  True),
+    StructField("candidates_json",      StringType(), True),  # includes raw_score + spgid19 per candidate
+    StructField("raw_vector_score",     FloatType(),  True),  # top candidate boosted score
     StructField("top_candidate_name",   StringType(), True),
-    StructField("top_candidate_id",     StringType(), True), 
+    StructField("top_candidate_id",     StringType(), True),
+    StructField("top_candidate_spgid",  StringType(), True),  # NEW: spgid19 of top candidate
 ])
 
 def is_valid_name(name: str, max_digit_fraction: float) -> bool:
@@ -111,15 +118,16 @@ def is_valid_name(name: str, max_digit_fraction: float) -> bool:
     return digit_ratio < max_digit_fraction
 
 def make_vector_worker(cfg: dict):
-    endpoint        = cfg["vector_endpoint"]
-    index_name      = cfg["vector_index"]
-    name_col        = cfg["vector_name_col"]
-    id_col          = cfg["vector_id_col"]
-    top_k           = cfg["vector_top_k"]
-    boost_exact     = cfg["score_boost_exact"]
-    boost_partial   = cfg["score_boost_partial"]
-    boost_reverse   = cfg["score_boost_reverse"]
-    max_digit_frac  = cfg["max_digit_fraction"]
+    endpoint       = cfg["vector_endpoint"]
+    index_name     = cfg["vector_index"]
+    name_col       = cfg["vector_name_col"]
+    id_col         = cfg["vector_id_col"]
+    spgid_col      = cfg["vector_spgid_col"]
+    top_k          = cfg["vector_top_k"]
+    boost_exact    = cfg["score_boost_exact"]
+    boost_partial  = cfg["score_boost_partial"]
+    boost_reverse  = cfg["score_boost_reverse"]
+    max_digit_frac = cfg["max_digit_fraction"]
 
     def worker(iterator):
         import json
@@ -133,19 +141,19 @@ def make_vector_worker(cfg: dict):
                 name_keyword = str(row["name_keyword"]) if row["name_keyword"] else ""
 
                 try:
-                    # Similarity query on Cleaned Name
+                    # Primary: similarity search on cleaned name
                     r1 = index.similarity_search(
                         query_text=name_clean,
-                        columns=[name_col, id_col],
+                        columns=[name_col, id_col, spgid_col],  # pull spgid19 too
                         num_results=top_k
                     ).get("result", {}).get("data_array", [])
 
-                    # Secondary query on Keyword fallback
+                    # Secondary: keyword fallback
                     r2 = []
                     if name_keyword and name_keyword.lower() != name_clean.lower():
                         r2 = index.similarity_search(
                             query_text=name_keyword,
-                            columns=[name_col, id_col],
+                            columns=[name_col, id_col, spgid_col],
                             num_results=top_k
                         ).get("result", {}).get("data_array", [])
 
@@ -155,9 +163,10 @@ def make_vector_worker(cfg: dict):
 
                     for data, weight in [(r1, 1.0), (r2, 0.95)]:
                         for r in data:
-                            c_name  = str(r[0]).strip()   # childcompanyname
-                            c_id    = str(r[1]).strip()   # childcompanyid
-                            v_score = float(r[-1])        # Distance score
+                            c_name   = str(r[0]).strip()   # childcompanyname
+                            c_id     = str(r[1]).strip()   # childcompanyid
+                            c_spgid  = str(r[2]).strip()   # spgid19
+                            v_score  = float(r[-1])        # raw distance score
 
                             if not is_valid_name(c_name, max_digit_frac):
                                 continue
@@ -172,55 +181,78 @@ def make_vector_worker(cfg: dict):
                             else:
                                 boost = 1.0
 
-                            final_score = round(v_score * 100 * boost * weight, 2)
+                            raw_score_pct  = round(v_score * 100, 2)
+                            final_score    = round(raw_score_pct * boost * weight, 2)
 
                             if c_name not in seen or final_score > seen[c_name]["score"]:
-                                seen[c_name] = {"score": final_score, "id": c_id}
+                                seen[c_name] = {
+                                    "score":     final_score,
+                                    "raw_score": raw_score_pct,   # pre-boost, for diagnostics
+                                    "id":        c_id,
+                                    "spgid19":   c_spgid,
+                                }
 
                     processed = sorted(
-                        [{"name": n, "id": info["id"], "score": info["score"]} for n, info in seen.items()],
-                        key=lambda x: x["score"], reverse=True
+                        [
+                            {
+                                "name":      n,
+                                "id":        info["id"],
+                                "spgid19":   info["spgid19"],
+                                "score":     info["score"],
+                                "raw_score": info["raw_score"],
+                            }
+                            for n, info in seen.items()
+                        ],
+                        key=lambda x: x["score"],
+                        reverse=True
                     )[:5]
 
                     top = processed[0] if processed else None
 
                     results.append({
-                        "name_clean":         name_clean,
-                        "name_keyword":       name_keyword,
-                        "candidates_json":    json.dumps(processed),
-                        "raw_vector_score":   top["score"] if top else 0.0,
-                        "top_candidate_name": top["name"]  if top else "",
-                        "top_candidate_id":   top["id"]    if top else "",
+                        "name_clean":          name_clean,
+                        "name_keyword":        name_keyword,
+                        "candidates_json":     json.dumps(processed),
+                        "raw_vector_score":    top["score"]   if top else 0.0,
+                        "top_candidate_name":  top["name"]    if top else "",
+                        "top_candidate_id":    top["id"]      if top else "",
+                        "top_candidate_spgid": top["spgid19"] if top else "",
                     })
 
-                except Exception:
+                except Exception as e:
                     results.append({
-                        "name_clean":         name_clean,
-                        "name_keyword":       name_keyword,
-                        "candidates_json":    "[]",
-                        "raw_vector_score":   0.0,
-                        "top_candidate_name": "",
-                        "top_candidate_id":   "",
+                        "name_clean":          name_clean,
+                        "name_keyword":        name_keyword,
+                        "candidates_json":     "[]",
+                        "raw_vector_score":    0.0,
+                        "top_candidate_name":  "",
+                        "top_candidate_id":    "",
+                        "top_candidate_spgid": "",
                     })
+
             yield pd.DataFrame(results)
     return worker
 
 # ============================================================
 # STEP 3: LLM PROMPT
+# Stricter: UNMATCHED is the safe default, partial match is not enough
 # ============================================================
 
 def build_prompt_column():
     return F.concat_ws("",
-        F.lit("You are an enterprise data entity resolution bot.\n\n"),
+        F.lit("You are a strict enterprise entity resolution assistant.\n\n"),
         F.lit("RAW NAME: "),     F.col("name_clean"),
         F.lit("\nCANDIDATES: "), F.col("candidates_json"),
         F.lit(
             "\n\nINSTRUCTIONS:\n"
-            "1. Match the RAW NAME to the best legal candidate from the provided JSON array.\n"
-            "2. Extract both the exact corporate name and its corresponding 'id' value string.\n"
-            "3. If there are no matches that structurally fit, reply UNMATCHED for the name and leave the ID blank.\n\n"
-            "OUTPUT FORMAT ONLY:\n"
-            "[MATCH]: <legal entity name or UNMATCHED> | [MATCHED_ID]: <id value or BLANK> | [REASON]: <one sentence explanation>"
+            "1. Match RAW NAME to the single best legal entity from CANDIDATES.\n"
+            "2. Only match if you are highly confident they refer to the SAME real-world organization.\n"
+            "3. A similar industry, partial word overlap, or abbreviation alone is NOT enough to match.\n"
+            "4. If the RAW NAME appears truncated or ambiguous, only match if one candidate is unambiguously correct.\n"
+            "5. If uncertain or no candidate clearly fits, output UNMATCHED — this is the safe and preferred default.\n"
+            "6. Extract both the exact candidate name and its 'id' field from the JSON.\n\n"
+            "OUTPUT FORMAT — respond with exactly this structure and nothing else:\n"
+            "[MATCH]: <exact candidate name or UNMATCHED> | [MATCHED_ID]: <id value or BLANK> | [REASON]: <one sentence>"
         )
     )
 
@@ -231,7 +263,7 @@ def build_prompt_column():
 def run_pipeline(cfg: dict):
     spark.catalog.clearCache()
 
-    # 4a. Run cleaning on sources
+    # 4a. Normalize sources
     source_dfs = []
     for src in cfg["sources"]:
         df = normalize(
@@ -242,18 +274,18 @@ def run_pipeline(cfg: dict):
         )
         source_dfs.append((src, df))
 
-    # 4b. Registry Generation
+    # 4b. Deduplicated name registry across all sources
     all_dfs = [d for _, d in source_dfs]
     search_registry = all_dfs[0].select("name_clean", "name_keyword")
-    if len(all_dfs) > 1:
-        for extra_df in all_dfs[1:]:
-            search_registry = search_registry.union(extra_df.select("name_clean", "name_keyword"))
-            
+    for extra_df in all_dfs[1:]:
+        search_registry = search_registry.union(extra_df.select("name_clean", "name_keyword"))
+
     search_registry = search_registry.distinct().filter(
-        F.col("name_clean").isNotNull() & (F.length(F.trim(F.col("name_clean"))) >= cfg["min_name_length"])
+        F.col("name_clean").isNotNull() &
+        (F.length(F.trim(F.col("name_clean"))) >= cfg["min_name_length"])
     )
 
-    # 4c. Vector Similarity Phase
+    # 4c. Vector similarity phase
     vector_worker = make_vector_worker(cfg)
     registry_matches = (
         search_registry
@@ -262,7 +294,7 @@ def run_pipeline(cfg: dict):
         .cache()
     )
 
-    # 4d. LLM Invocation
+    # 4d. LLM invocation
     answer_key = (
         registry_matches
         .withColumn("prompt", build_prompt_column())
@@ -277,44 +309,97 @@ def run_pipeline(cfg: dict):
         .cache()
     )
 
-    # 4e. Compiling + Writing Output
+    # 4e. Compile and write output per source
     for src_meta, df_clean in source_dfs:
+
         df_final = (
             df_clean
             .join(registry_matches, on="name_clean", how="left")
             .join(answer_key.select("name_clean", "llm_raw"), on="name_clean", how="left")
         )
 
-        # Extraction logic matching your token split targets
+        # Parse LLM output tokens
         df_final = (
             df_final
-            .withColumn("llm_name", F.trim(F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1), r"[\*\[\]\"']", "")))
-            .withColumn("llm_id",   F.trim(F.regexp_replace(F.regexp_extract("llm_raw", r"\[MATCHED_ID\]:\s*([^|]+)", 1), r"[\*\[\]\"']", "")))
-            .withColumn("match_explanation", F.trim(F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1)))
+            .withColumn("llm_name",
+                F.trim(F.regexp_replace(
+                    F.regexp_extract("llm_raw", r"\[MATCH\]:\s*([^|]+)", 1),
+                    r"[\*\[\]\"']", ""
+                ))
+            )
+            .withColumn("llm_id",
+                F.trim(F.regexp_replace(
+                    F.regexp_extract("llm_raw", r"\[MATCHED_ID\]:\s*([^|]+)", 1),
+                    r"[\*\[\]\"']", ""
+                ))
+            )
+            .withColumn("match_explanation",
+                F.trim(F.regexp_extract("llm_raw", r"\[REASON\]:\s*(.*)", 1))
+            )
         )
 
-        # Fallback evaluation mapping names and corporate IDs
-        df_final = df_final.withColumn(
-            "childcompanyname",
-            F.when(F.col("llm_name").isNotNull() & (F.upper(F.col("llm_name")) != "UNMATCHED"), F.col("llm_name"))
-             .when((F.col("raw_vector_score") >= cfg["score_fallback_min"]) & F.col("top_candidate_name").isNotNull(), F.col("top_candidate_name"))
-             .otherwise(F.lit("No Clear Match"))
-        ).withColumn(
-            "childcompanyid",
-            F.when(F.col("llm_name").isNotNull() & (F.upper(F.col("llm_name")) != "UNMATCHED"), F.col("llm_id"))
-             .when((F.col("raw_vector_score") >= cfg["score_fallback_min"]) & F.col("top_candidate_name").isNotNull(), F.col("top_candidate_id"))
-             .otherwise(F.lit(None).cast(StringType()))
+        # Resolution logic with fallback
+        # Priority: LLM match → vector fallback (if score >= threshold) → No Clear Match
+        df_final = (
+            df_final
+            .withColumn(
+                "childcompanyname",
+                F.when(
+                    F.col("llm_name").isNotNull() & (F.upper(F.col("llm_name")) != "UNMATCHED") & (F.trim(F.col("llm_name")) != ""),
+                    F.col("llm_name")
+                ).when(
+                    (F.col("raw_vector_score") >= cfg["score_fallback_min"]) &
+                    F.col("top_candidate_name").isNotNull() & (F.trim(F.col("top_candidate_name")) != ""),
+                    F.col("top_candidate_name")
+                ).otherwise(F.lit("No Clear Match"))
+            )
+            .withColumn(
+                "childcompanyid",
+                F.when(
+                    F.col("llm_name").isNotNull() & (F.upper(F.col("llm_name")) != "UNMATCHED") & (F.trim(F.col("llm_name")) != ""),
+                    F.col("llm_id")
+                ).when(
+                    (F.col("raw_vector_score") >= cfg["score_fallback_min"]) &
+                    F.col("top_candidate_name").isNotNull() & (F.trim(F.col("top_candidate_name")) != ""),
+                    F.col("top_candidate_id")
+                ).otherwise(F.lit(None).cast(StringType()))
+            )
+            # Diagnostic: what spgid19 did the top vector candidate carry?
+            # Compare this against source spgid19 to understand index-level accuracy
+            .withColumn(
+                "index_spgid19",
+                F.col("top_candidate_spgid")
+            )
+            # Match method tag — useful for accuracy slicing
+            .withColumn(
+                "match_method",
+                F.when(
+                    F.col("llm_name").isNotNull() & (F.upper(F.col("llm_name")) != "UNMATCHED") & (F.trim(F.col("llm_name")) != ""),
+                    F.lit("LLM")
+                ).when(
+                    (F.col("raw_vector_score") >= cfg["score_fallback_min"]) &
+                    F.col("top_candidate_name").isNotNull(),
+                    F.lit("VECTOR_FALLBACK")
+                ).otherwise(F.lit("NO_MATCH"))
+            )
         )
 
-        # Structuring explicitly requested output schema
+        # Final output schema
+        # spgid19        = Kensho-resolved ID from source (ground truth for comparison)
+        # index_spgid19  = spgid19 carried by top vector candidate (diagnostic)
+        # childcompanyid = pipeline's resolved ID (what we're trying to get right)
         final_cols = [
             "sor_id",
-            "src_company_name_raw",    # raw name
-            "name_clean",              # clean name
-            "childcompanyname",        # s&p company it matched
-            "childcompanyid",          # childcompanyid from vector search index payload
-            "spgid19",                 # spgid19 from your source table
-            "match_explanation"        # match explanation
+            "src_company_name_raw",
+            "name_clean",
+            "childcompanyname",
+            "childcompanyid",
+            "spgid19",           # source ground truth
+            "index_spgid19",     # what the vector index returned as spgid19
+            "raw_vector_score",
+            "match_method",
+            "match_explanation",
+            "candidates_json",   # full candidate list with raw scores — remove in prod
         ]
 
         out_table = f"{cfg['output_database']}.{src_meta['output_table']}"
@@ -325,9 +410,53 @@ def run_pipeline(cfg: dict):
             .option("overwriteSchema", "true")
             .saveAsTable(out_table)
         )
-        print(f"✅ Processed successfully -> Saved to Delta Table: {out_table}")
+        print(f"✅ Processed successfully -> Saved to: {out_table}")
 
 # ============================================================
 # ENTRY POINT
 # ============================================================
 run_pipeline(CONFIG)
+
+
+# ============================================================
+# DIAGNOSTIC AUDIT — Run in a separate cell after pipeline
+# ============================================================
+# 
+# Paste this into a new notebook cell to evaluate accuracy:
+#
+# audit = spark.sql("""
+# WITH base AS (
+#     SELECT *,
+#         REGEXP_REPLACE(CAST(CAST(childcompanyid AS DOUBLE) AS BIGINT), '[^0-9]', '') AS resolved_id_clean,
+#         REGEXP_REPLACE(CAST(CAST(spgid19        AS DOUBLE) AS BIGINT), '[^0-9]', '') AS kensho_id_clean,
+#         REGEXP_REPLACE(CAST(CAST(index_spgid19  AS DOUBLE) AS BIGINT), '[^0-9]', '') AS index_id_clean
+#     FROM dev.mma_entityresolution.entity_resolution_ach_received_kensho_resolved
+#     WHERE spgid19 IS NOT NULL
+# ),
+# classified AS (
+#     SELECT *,
+#         CASE
+#             WHEN resolved_id_clean = kensho_id_clean           THEN 'CORRECT'
+#             WHEN childcompanyname  = 'No Clear Match'          THEN 'NO_MATCH'
+#             WHEN index_id_clean    = kensho_id_clean           THEN 'RIGHT_IN_CANDIDATES_LLM_MISSED'
+#             ELSE                                                    'WRONG_ENTITY'
+#         END AS accuracy_label
+#     FROM base
+# )
+# SELECT
+#     accuracy_label,
+#     match_method,
+#     COUNT(*) AS row_count,
+#     ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER(), 2) AS pct
+# FROM classified
+# GROUP BY accuracy_label, match_method
+# ORDER BY row_count DESC
+# """)
+# audit.display()
+#
+# KEY INSIGHT FROM LABELS:
+# - CORRECT                    → pipeline matched Kensho ✅
+# - NO_MATCH                   → pipeline gave up (may be correct or missed)
+# - RIGHT_IN_CANDIDATES_LLM_MISSED → vector found the right entity but LLM chose wrong one
+# - WRONG_ENTITY               → vector search itself is returning wrong candidates
+# ============================================================
