@@ -1,33 +1,42 @@
+import java.sql.DriverManager as DriverManager
+
 def load_monthly_to_table(aod_c):
-    # 1. Fetch paths from your helper function
+    # 1. Get the ADLS folder path where the parquet files live
     parquet_stage_abfss, _ = get_monthly_stage_paths(aod_c)
     
-    # 2. Read the source parquet files into a DataFrame
-    df = spark.read.parquet(parquet_stage_abfss)
+    # 2. Format the path for the COPY INTO command
+    # It needs to point to the directory or use a wildcard for the parquet files
+    if not parquet_stage_abfss.endswith('/'):
+        parquet_stage_abfss += '/'
+    source_path = f"{parquet_stage_abfss}*.parquet"
     
-    # 3. Fetch token for authentication
-    access_token = mssparkutils.credentials.getToken("DW")
+    # 3. Construct the high-performance native T-SQL COPY statement
+    # This instructs your DW1500c engine to pull the files directly in parallel
+    copy_statement = f"""
+    COPY INTO dgsa_gold.balance_flow_monthly
+    FROM '{source_path}'
+    WITH (
+        FILE_TYPE = 'PARQUET',
+        CREDENTIAL = (IDENTITY = 'Managed Identity'),
+        AUTO_CREATE_TABLE = 'OFF'
+    );
+    """
     
-    print(f"Starting optimized JDBC Bulk load into Dedicated Pool for date: {aod_c}...")
+    print(f"Triggering direct COPY INTO on DW1500c from storage path: {source_path}")
     
-    # 4. Standard JDBC format but loaded with parameters to force bulk speed
-    (
-        df.write
-        .format("jdbc")                                                    # Safe standard format to avoid data source errors
-        .option("url", jdbc_url_write)
-        .option("dbtable", "dgsa_gold.balance_flow_monthly")
-        .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")    # Leverages your working driver
-        .option("accessToken", access_token)
-        .option("isolationLevel", "NONE")                                  # Drops transactional logging overhead
-        .option("batchsize", "150000")                                     # Groups records into massive network flushes
-        .option("tableLock", "true")                                       # CRITICAL: Disables row-locks to allow direct bulk writes
-        .mode("append")
-        .save()
-    )
+    # 4. Open a direct connection to execute the command string
+    conn = DriverManager.getConnection(jdbc_url_write)
+    stmt = conn.createStatement()
     
-    print("Bulk load write complete. Fetching inserted row count...")
+    # This will trigger the database-side parallel ingestion engine
+    stmt.execute(copy_statement)
+    
+    stmt.close()
+    conn.close()
+    print("Direct COPY INTO operation completed successfully.")
 
-    # 5. Fast Count Check using the exact same safe JDBC setup
+    # 5. Fast Count Check
+    access_token = mssparkutils.credentials.getToken("DW")
     inserted_rows = (
         spark.read
         .format("jdbc")
