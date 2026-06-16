@@ -1,56 +1,6 @@
-import java.sql.DriverManager as DriverManager
-
-def load_monthly_to_table(aod_c):
-    # 1. Get the ADLS folder path where the parquet files live
-    parquet_stage_abfss, _ = get_monthly_stage_paths(aod_c)
-    
-    # 2. Format the path for the COPY INTO command
-    # It needs to point to the directory or use a wildcard for the parquet files
-    if not parquet_stage_abfss.endswith('/'):
-        parquet_stage_abfss += '/'
-    source_path = f"{parquet_stage_abfss}*.parquet"
-    
-    # 3. Construct the high-performance native T-SQL COPY statement
-    # This instructs your DW1500c engine to pull the files directly in parallel
-    copy_statement = f"""
-    COPY INTO dgsa_gold.balance_flow_monthly
-    FROM '{source_path}'
-    WITH (
-        FILE_TYPE = 'PARQUET',
-        CREDENTIAL = (IDENTITY = 'Managed Identity'),
-        AUTO_CREATE_TABLE = 'OFF'
-    );
-    """
-    
-    print(f"Triggering direct COPY INTO on DW1500c from storage path: {source_path}")
-    
-    # 4. Open a direct connection to execute the command string
-    conn = DriverManager.getConnection(jdbc_url_write)
-    stmt = conn.createStatement()
-    
-    # This will trigger the database-side parallel ingestion engine
-    stmt.execute(copy_statement)
-    
-    stmt.close()
-    conn.close()
-    print("Direct COPY INTO operation completed successfully.")
-
-    # 5. Fast Count Check
-    access_token = mssparkutils.credentials.getToken("DW")
-    inserted_rows = (
-        spark.read
-        .format("jdbc")
-        .option("url", jdbc_url_write)
-        .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
-        .option("accessToken", access_token)
-        .option("query", f"""
-            SELECT COUNT(*) AS cnt 
-            FROM dgsa_gold.balance_flow_monthly 
-            WHERE as_of_dt = '{aod_c}'
-        """)
-        .load()
-        .collect()[0]["cnt"]
-    )
-    
-    print(f"Successfully processed. Total rows for {aod_c}: {inserted_rows}")
-    return inserted_rows
+@concat(
+    'SELECT * FROM ccsi.', 
+    pipeline().parameters.source_table_name, 
+    ' WHERE MOD(YOUR_INDEXED_COLUMN, 14) = ', 
+    pipeline().parameters.child_loop_item
+)
