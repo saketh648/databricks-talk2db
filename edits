@@ -1,1 +1,6 @@
-@{'SELECT * FROM ccsi.'}@{pipeline().parameters.source_table_name}@{' WHERE MOD(COMM_OCCR_ID, 20) = '}@{pipeline().parameters.child_loop_item}
+@concat(
+    'SELECT * FROM ccsi.', 
+    pipeline().parameters.source_table_name, 
+    ' WHERE MOD(COMM_OCCR_ID, 20) = ', 
+    string(pipeline().parameters.child_loop_item)
+)
