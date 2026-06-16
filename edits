@@ -1,6 +1,6 @@
 @concat(
     'SELECT * FROM ccsi.', 
     pipeline().parameters.source_table_name, 
-    ' WHERE MOD(YOUR_INDEXED_COLUMN, 14) = ', 
+    ' WHERE MOD(YOUR_INDEXED_COLUMN, 20) = ', 
     pipeline().parameters.child_loop_item
 )
