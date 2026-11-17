@@ -1,21 +1,312 @@
-# Add the mandatory 'match_explanation' field for the final audit trail
-def finalize_for_storage(df):
-    return df.withColumn("match_explanation", 
-        F.when(F.col("match_level") == "CHILD", "High Confidence S&P Match (>=92)")
-         .when(F.col("match_level") == "PARENT", "Parent/Legal Entity Roll-up (85-91)")
-         .otherwise("Unmatched - Review required")
-    )
-
-# Prepare the final DataFrames
-final_org_output = finalize_for_storage(final_org_results)
-final_rec_output = finalize_for_storage(final_rec_results)
-
-# Write to Delta (This should take < 30 seconds once cached)
-final_org_output.write.format("delta").mode("overwrite").option("overwriteSchema", "true") \
-    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_origination")
-
-final_rec_output.write.format("delta").mode("overwrite").option("overwriteSchema", "true") \
-    .saveAsTable("dev.mma_entityresolution.entity_resolution_ach_received")
-
-print("✅ Tables created: dev.mma_entityresolution.entity_resolution_ach_origination")
-print("✅ Tables created: dev.mma_entityresolution.entity_resolution_ach_received")
+{
+  "name": "sync-one-kv-secret-to-akv",
+  "properties": {
+    "description": "Child pipeline: sync ONE KV v2 secret (all its keys) into AKV. Called once per secret from sync-kv-to-akv. One AKV secret per KV key, named <secret>-<key>. Returns changes_json via Pipeline Return Value.",
+    "parameters": {
+      "secret_name": {
+        "type": "string"
+      },
+      "secret_data_json": {
+        "type": "string"
+      },
+      "version": {
+        "type": "string"
+      },
+      "updated_time": {
+        "type": "string"
+      },
+      "akv_url": {
+        "type": "string",
+        "defaultValue": "https://kv-cus-synpeacx-prod-01.vault.azure.net"
+      },
+      "akv_name_prefix": {
+        "type": "string",
+        "defaultValue": ""
+      },
+      "kv_mount": {
+        "type": "string",
+        "defaultValue": "secret"
+      },
+      "kv_path": {
+        "type": "string",
+        "defaultValue": "prod/moneymovement"
+      }
+    },
+    "variables": {
+      "changes": {
+        "type": "Array"
+      },
+      "akv_name": {
+        "type": "String"
+      },
+      "current_key": {
+        "type": "String"
+      },
+      "current_value": {
+        "type": "String"
+      }
+    },
+    "activities": [
+      {
+        "name": "for_each_kv_key",
+        "description": "Single ForEach in this pipeline. Sequential: akv_name / current_key / current_value variables are not safe in parallel.",
+        "type": "ForEach",
+        "dependsOn": [],
+        "typeProperties": {
+          "items": {
+            "type": "Expression",
+            "value": "@keys(json(pipeline().parameters.secret_data_json))"
+          },
+          "isSequential": true,
+          "activities": [
+            {
+              "name": "set_akv_name",
+              "description": "AKV allows only letters, digits and -. Replace _ and . with -. e.g. digital_qualtrics + client_id = digital-qualtrics-client-id",
+              "type": "SetVariable",
+              "dependsOn": [],
+              "typeProperties": {
+                "variableName": "akv_name",
+                "value": {
+                  "type": "Expression",
+                  "value": "@concat(pipeline().parameters.akv_name_prefix, replace(replace(pipeline().parameters.secret_name,'_','-'),'.','-'), '-', replace(replace(item(),'_','-'),'.','-'))"
+                }
+              }
+            },
+            {
+              "name": "set_current_key",
+              "type": "SetVariable",
+              "dependsOn": [
+                {
+                  "activity": "set_akv_name",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
+              ],
+              "typeProperties": {
+                "variableName": "current_key",
+                "value": {
+                  "type": "Expression",
+                  "value": "@item()"
+                }
+              }
+            },
+            {
+              "name": "set_current_value",
+              "type": "SetVariable",
+              "dependsOn": [
+                {
+                  "activity": "set_current_key",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
+              ],
+              "typeProperties": {
+                "variableName": "current_value",
+                "value": {
+                  "type": "Expression",
+                  "value": "@string(json(pipeline().parameters.secret_data_json)[variables('current_key')])"
+                }
+              }
+            },
+            {
+              "name": "get_akv_secret",
+              "description": "404 means the secret does not exist yet. Failure is handled by the next activity.",
+              "type": "WebActivity",
+              "dependsOn": [
+                {
+                  "activity": "set_current_value",
+                  "dependencyConditions": [
+                    "Succeeded"
+                  ]
+                }
+              ],
+              "policy": {
+                "timeout": "0.00:05:00",
+                "retry": 0,
+                "retryIntervalInSeconds": 30,
+                "secureOutput": true,
+                "secureInput": false
+              },
+              "typeProperties": {
+                "method": "GET",
+                "url": {
+                  "type": "Expression",
+                  "value": "@{pipeline().parameters.akv_url}/secrets/@{variables('akv_name')}?api-version=7.4"
+                },
+                "connectVia": {
+                  "referenceName": "adfselfhostexcldir-special-projects",
+                  "type": "IntegrationRuntimeReference"
+                },
+                "authentication": {
+                  "type": "MSI",
+                  "resource": "https://vault.azure.net"
+                }
+              }
+            },
+            {
+              "name": "if_new_or_updated",
+              "description": "True when missing in AKV, or KV version differs from vault_version tag in AKV.",
+              "type": "IfCondition",
+              "dependsOn": [
+                {
+                  "activity": "get_akv_secret",
+                  "dependencyConditions": [
+                    "Succeeded",
+                    "Failed"
+                  ]
+                }
+              ],
+              "typeProperties": {
+                "expression": {
+                  "type": "Expression",
+                  "value": "@or(equals(activity('get_akv_secret').Status,'Failed'), not(equals(string(coalesce(activity('get_akv_secret').output?.tags?.vault_version,'')), pipeline().parameters.version)))"
+                },
+                "ifTrueActivities": [
+                  {
+                    "name": "put_akv_secret",
+                    "description": "Each PUT creates a new AKV secret version. Value is only this one KV key's value.",
+                    "type": "WebActivity",
+                    "dependsOn": [],
+                    "policy": {
+                      "timeout": "0.00:05:00",
+                      "retry": 2,
+                      "retryIntervalInSeconds": 30,
+                      "secureOutput": true,
+                      "secureInput": true
+                    },
+                    "typeProperties": {
+                      "method": "PUT",
+                      "url": {
+                        "type": "Expression",
+                        "value": "@{pipeline().parameters.akv_url}/secrets/@{variables('akv_name')}?api-version=7.4"
+                      },
+                      "connectVia": {
+                        "referenceName": "adfselfhostexcldir-special-projects",
+                        "type": "IntegrationRuntimeReference"
+                      },
+                      "headers": {
+                        "Content-Type": "application/json"
+                      },
+                      "body": {
+                        "value": "@{variables('current_value')}",
+                        "contentType": "application/json",
+                        "tags": {
+                          "kv_key": "@{variables('current_key')}",
+                          "synced_by": "adf-sync-kv-to-akv",
+                          "vault_path": "@{concat(pipeline().parameters.kv_mount,'/',pipeline().parameters.kv_path,'/',pipeline().parameters.secret_name)}",
+                          "vault_updated": "@{pipeline().parameters.updated_time}",
+                          "vault_version": "@{pipeline().parameters.version}"
+                        }
+                      },
+                      "authentication": {
+                        "type": "MSI",
+                        "resource": "https://vault.azure.net"
+                      }
+                    }
+                  },
+                  {
+                    "name": "append_change",
+                    "description": "Names, paths and version only, never values",
+                    "type": "AppendVariable",
+                    "dependsOn": [
+                      {
+                        "activity": "put_akv_secret",
+                        "dependencyConditions": [
+                          "Succeeded"
+                        ]
+                      }
+                    ],
+                    "typeProperties": {
+                      "variableName": "changes",
+                      "value": {
+                        "type": "Expression",
+                        "value": "@json(concat('{\"name\":\"', variables('akv_name'), '\",\"path\":\"', pipeline().parameters.kv_mount, '/', pipeline().parameters.kv_path, '/', pipeline().parameters.secret_name, '\",\"key\":\"', variables('current_key'), '\",\"type\":\"', if(equals(activity('get_akv_secret').Status,'Failed'),'NEW','UPDATED'), '\",\"version\":\"', pipeline().parameters.version, '\"}'))"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "filter_new",
+        "type": "Filter",
+        "dependsOn": [
+          {
+            "activity": "for_each_kv_key",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "items": {
+            "type": "Expression",
+            "value": "@variables('changes')"
+          },
+          "condition": {
+            "type": "Expression",
+            "value": "@equals(item().type,'NEW')"
+          }
+        }
+      },
+      {
+        "name": "filter_updated",
+        "type": "Filter",
+        "dependsOn": [
+          {
+            "activity": "for_each_kv_key",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "items": {
+            "type": "Expression",
+            "value": "@variables('changes')"
+          },
+          "condition": {
+            "type": "Expression",
+            "value": "@equals(item().type,'UPDATED')"
+          }
+        }
+      },
+      {
+        "name": "set_return_value",
+        "description": "Pipeline Return Value: return changes as a JSON string so the parent can merge them for one digest email. Create this in the UI if JSON import complains: Set Variable > Variable type = Pipeline return value.",
+        "type": "SetVariable",
+        "dependsOn": [
+          {
+            "activity": "filter_new",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          },
+          {
+            "activity": "filter_updated",
+            "dependencyConditions": [
+              "Succeeded"
+            ]
+          }
+        ],
+        "typeProperties": {
+          "variableName": "Pipeline return value",
+          "value": [
+            {
+              "key": "changes_json",
+              "value": {
+                "type": "Expression",
+                "content": "@{string(variables('changes'))}"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
