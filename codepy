@@ -1,7 +1,7 @@
 {
   "name": "sync-kv-to-akv",
   "properties": {
-    "description": "Parent: sync HashiCorp Vault KV v2 secrets under secret/prod/moneymovement into Azure Key Vault. Lists secrets, reads each one, then calls child sync-one-kv-secret-to-akv once per secret (ADF cannot nest ForEach inside ForEach). All Web activities run on adfselfhostexcldir-special-projects. Sends one digest email via Logic App.",
+    "description": "Parent: sync HashiCorp Vault KV v2 secrets under secret/prod/moneymovement into Azure Key Vault. Lists secrets, reads each one, then calls child sync-one-kv-secret-to-akv once per secret (ADF cannot nest ForEach inside ForEach). All Web activities run on adfselfhostexcldir-special-projects. Sends one completion email via Logic App listing secrets processed. Child return value is kept for run history, parent does not merge it - SetVariable cannot self-reference.",
     "parameters": {
       "vault_url": {
         "type": "string",
@@ -59,6 +59,9 @@
       },
       "current_data": {
         "type": "String"
+      },
+      "completed_secrets": {
+        "type": "Array"
       }
     },
     "activities": [
@@ -358,9 +361,9 @@
               }
             },
             {
-              "name": "merge_child_changes",
-              "description": "Merge the child's returned changes into the parent's changes array for one digest email.",
-              "type": "SetVariable",
+              "name": "append_completed_secret",
+              "description": "AppendVariable, not SetVariable. SetVariable cannot reference the variable it sets. AppendVariable is the ForEach-safe way to accumulate.",
+              "type": "AppendVariable",
               "dependsOn": [
                 {
                   "activity": "execute_child_secret",
@@ -370,10 +373,10 @@
                 }
               ],
               "typeProperties": {
-                "variableName": "changes",
+                "variableName": "completed_secrets",
                 "value": {
                   "type": "Expression",
-                  "value": "@union(variables('changes'), json(activity('execute_child_secret').output.pipelineReturnValue.changes_json))"
+                  "value": "@variables('current_secret')"
                 }
               }
             }
@@ -381,61 +384,11 @@
         }
       },
       {
-        "name": "filter_new",
-        "type": "Filter",
-        "dependsOn": [
-          {
-            "activity": "for_each_kv_secret",
-            "dependencyConditions": [
-              "Succeeded"
-            ]
-          }
-        ],
-        "typeProperties": {
-          "items": {
-            "type": "Expression",
-            "value": "@variables('changes')"
-          },
-          "condition": {
-            "type": "Expression",
-            "value": "@equals(item().type,'NEW')"
-          }
-        }
-      },
-      {
-        "name": "filter_updated",
-        "type": "Filter",
-        "dependsOn": [
-          {
-            "activity": "for_each_kv_secret",
-            "dependencyConditions": [
-              "Succeeded"
-            ]
-          }
-        ],
-        "typeProperties": {
-          "items": {
-            "type": "Expression",
-            "value": "@variables('changes')"
-          },
-          "condition": {
-            "type": "Expression",
-            "value": "@equals(item().type,'UPDATED')"
-          }
-        }
-      },
-      {
-        "name": "if_has_changes",
+        "name": "if_send_email",
         "type": "IfCondition",
         "dependsOn": [
           {
-            "activity": "filter_new",
-            "dependencyConditions": [
-              "Succeeded"
-            ]
-          },
-          {
-            "activity": "filter_updated",
+            "activity": "for_each_kv_secret",
             "dependencyConditions": [
               "Succeeded"
             ]
@@ -444,12 +397,12 @@
         "typeProperties": {
           "expression": {
             "type": "Expression",
-            "value": "@and(pipeline().parameters.send_email, greater(length(variables('changes')),0))"
+            "value": "@pipeline().parameters.send_email"
           },
           "ifTrueActivities": [
             {
               "name": "email_digest_logic_app",
-              "description": "One digest email for the whole run.",
+              "description": "One digest email for the whole run. Lists secret names processed, not per-key NEW/UPDATED - that detail lives in the child runs.",
               "type": "WebActivity",
               "dependsOn": [],
               "policy": {
@@ -473,14 +426,14 @@
                   "Content-Type": "application/json"
                 },
                 "body": {
-                  "subject": "@{concat('KV to AKV sync: ', string(length(activity('filter_new').output.Value)), ' new, ', string(length(activity('filter_updated').output.Value)), ' updated')}",
+                  "subject": "@{concat('KV to AKV sync completed: ', string(length(variables('completed_secrets'))), ' secrets processed')}",
                   "pipeline": "@{pipeline().Pipeline}",
                   "runId": "@{pipeline().RunId}",
                   "timestamp": "@{utcnow()}",
-                  "newCount": "@length(activity('filter_new').output.Value)",
-                  "rotatedCount": "@length(activity('filter_updated').output.Value)",
-                  "newSecrets": "@activity('filter_new').output.Value",
-                  "rotatedSecrets": "@activity('filter_updated').output.Value"
+                  "newCount": "@length(variables('completed_secrets'))",
+                  "rotatedCount": 0,
+                  "newSecrets": "@variables('completed_secrets')",
+                  "rotatedSecrets": []
                 }
               }
             }
